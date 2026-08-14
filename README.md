@@ -13,8 +13,6 @@ Playing modern media files (MKV, WebM, AVI) natively in QuickTime Player or Appl
 
 These scripts automate the stream inspection, tag resolution, transcoding, and packaging logic into simple commands.
 
----
-
 ## Scripts
 
 | Script | Description |
@@ -22,15 +20,11 @@ These scripts automate the stream inspection, tag resolution, transcoding, and p
 | [`quickmp4.py`](quickmp4.py) | Remuxes MKV, WebM, and other video formats into QuickTime-compatible MP4s with proper FourCC tags (`avc1`, `hvc1`, `dvh1`), lossless audio fallback (ALAC), and `mov_text` subtitles. |
 | [`remuxddp.py`](remuxddp.py) | Batch media pipeline that downloads, extracts archives, transcodes audio to Dolby Digital Plus (E-AC-3), repackages, and uploads. |
 
----
-
 ## Requirements
 
 - **macOS** with `python3` (built-in)
 - **FFmpeg** (`ffmpeg` and `ffprobe`): `brew install ffmpeg`
 - **aria2** (`aria2c`, optional for remote downloads in `remuxddp`): `brew install aria2`
-
----
 
 ## Quick Usage
 
@@ -45,8 +39,6 @@ python3 quickmp4.py ~/Downloads/TVShow/
 python3 remuxddp.py video.mkv
 python3 remuxddp.py "https://example.com/archive.zip"
 ```
-
----
 
 ## Documentation
 
