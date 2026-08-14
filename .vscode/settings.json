@@ -1,0 +1,44 @@
+{
+  // -------------------------
+  // Ruff
+  // -------------------------
+  // Only use VS Code settings.
+  // Ignore pyproject.toml and ruff.toml.
+  "ruff.configurationPreference": "editorOnly",
+  "ruff.configuration": {
+    "preview": true,
+    "lint": {
+      // Ruff defaults + strict typing-oriented rules recommended
+      // alongside ty.
+      "extend-select": [
+        "ANN",
+        "PYI",
+        "PGH003"
+      ]
+    },
+    "format": {
+      "docstring-code-format": true
+    }
+  },
+  // -------------------------
+  // ty
+  // -------------------------
+  "ty.configuration": {
+    "rules": {
+      "blanket-ignore-comment": "error",
+      "missing-type-argument": "error",
+      "possibly-unresolved-reference": "warn",
+      "unsound-return-statement": "error",
+      "unsound-yield": "error",
+      "unsupported-dynamic-base": "warn",
+      // Astral warns these can have false positives.
+      "division-by-zero": "warn",
+      "possibly-missing-attribute": "warn",
+      "possibly-missing-import": "warn"
+    },
+    "analysis": {
+      "strict-literal-narrowing": true,
+      "strict-generic-narrowing": true
+    }
+  }
+}
