@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -131,7 +132,7 @@ ANSI_RESET: Final[str] = "\033[0m"
 
 def print_script_intro(name: str, description: str, detail: str | None = None) -> None:
     """Print the standard script header."""
-    print(f"\n{ANSI_BOLD}{name}{ANSI_RESET}: {description}")
+    print(f"\n{ANSI_BOLD}{name} v{VERSION}{ANSI_RESET}: {description}")
     if detail:
         print(detail)
 
@@ -151,7 +152,7 @@ def print_batch_item(position: int, total: int, path: Path) -> None:
 
 def print_saved(path: Path) -> None:
     """Print the path of the saved output file."""
-    print(f"{ANSI_GREEN}Saved{ANSI_RESET} {path}")
+    print(f"{ANSI_GREEN}Saved {path}{ANSI_RESET}")
 
 
 def print_skipped(path: Path) -> None:
@@ -170,7 +171,7 @@ def print_elapsed(seconds: float) -> None:
     if minutes or hours:
         parts.append(f"{minutes}m")
     parts.append(f"{remaining_seconds}s")
-    print(f"\nCompleted in {' '.join(parts)}")
+    print(f"{ANSI_DIM}Completed in {' '.join(parts)}{ANSI_RESET}")
 
 
 def print_error(message: str) -> None:
@@ -412,6 +413,7 @@ def remux_single_media_file(source_path: Path, output_path: Path) -> None:
             output_path=temp_output,
             streams=streams,
         )
+        print(shlex.join(command))
 
         result: subprocess.CompletedProcess[bytes] = subprocess.run(
             args=command, check=False
@@ -421,6 +423,7 @@ def remux_single_media_file(source_path: Path, output_path: Path) -> None:
                 f"Unable to remux '{source_path.name}' with FFmpeg (exit code {result.returncode})."
             )
 
+        print()
         os.replace(src=temp_output, dst=output_path)
 
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -151,7 +152,7 @@ ANSI_RESET: Final[str] = "\033[0m"
 
 def print_script_intro(name: str, description: str, detail: str | None = None) -> None:
     """Print the standard script header."""
-    print(f"\n{ANSI_BOLD}{name}{ANSI_RESET}: {description}")
+    print(f"\n{ANSI_BOLD}{name} v{VERSION}{ANSI_RESET}: {description}")
     if detail:
         print(detail)
 
@@ -186,7 +187,7 @@ def print_batch_item(position: int, total: int, path: Path) -> None:
 
 def print_saved(path: Path) -> None:
     """Print the path of the saved output file."""
-    print(f"{ANSI_GREEN}Saved{ANSI_RESET} {path}")
+    print(f"{ANSI_GREEN}Saved {path}{ANSI_RESET}")
 
 
 def print_uploaded(link: str) -> None:
@@ -205,7 +206,7 @@ def print_elapsed(seconds: float) -> None:
     if minutes or hours:
         parts.append(f"{minutes}m")
     parts.append(f"{remaining_seconds}s")
-    print(f"\nCompleted in {' '.join(parts)}")
+    print(f"{ANSI_DIM}Completed in {' '.join(parts)}{ANSI_RESET}")
 
 
 def print_error(message: str) -> None:
@@ -452,6 +453,7 @@ def remux_single_media_file(source_path: Path, output_path: Path) -> None:
         output_path=output_path,
         streams=streams,
     )
+    print(shlex.join(command))
 
     result: subprocess.CompletedProcess[bytes] = subprocess.run(
         args=command, check=False
@@ -460,6 +462,8 @@ def remux_single_media_file(source_path: Path, output_path: Path) -> None:
         exit_with_error(
             f"Unable to remux '{source_path.name}' with FFmpeg (exit code {result.returncode})."
         )
+
+    print()
 
 
 # --------------------------------------------------
@@ -546,7 +550,6 @@ def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Pa
     print_heading("Downloading")
     command: list[str]
     if aria2c:
-        print_operation(f"aria2c: download {url}")
         command = [
             aria2c,
             "--continue=true",
@@ -557,17 +560,18 @@ def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Pa
             url,
         ]
     elif curl:
-        print_operation(f"curl: download {url}")
         command = [curl, "-L", "-O", "--output-dir", str(destination_folder), url]
     else:
         exit_with_error("Install aria2 or curl to download files from URLs.")
 
+    print(shlex.join(command))
     result: subprocess.CompletedProcess[bytes] = subprocess.run(
         args=command, check=False
     )
     if result.returncode != 0:
         exit_with_error(f"Download failed with exit code {result.returncode}.")
 
+    print()
     after: set[Path] = set(destination_folder.iterdir())
     new_files: list[Path] = [
         path for path in after - before if not path.name.endswith(".aria2")
@@ -583,7 +587,6 @@ def upload_media_file_to_gofile(file_to_upload: Path) -> str:
     token: str | None = os.environ.get("GOFILE_TOKEN")
 
     print_heading("Uploading")
-    print_operation(f"curl: upload {file_to_upload.name} -> gofile.io")
     command: list[str] = [
         curl,
         "--fail-with-body",
@@ -597,6 +600,7 @@ def upload_media_file_to_gofile(file_to_upload: Path) -> str:
         command.extend(["--header", f"Authorization: Bearer {token}"])
     command.append("https://upload.gofile.io/uploadfile")
 
+    print(shlex.join(command))
     result: subprocess.CompletedProcess[str] = subprocess.run(
         args=command,
         capture_output=True,
@@ -692,7 +696,7 @@ def main() -> None:
                     source_path, audio_streams
                 )
                 print_heading("Remuxing")
-                print_found_item(source_path)
+                print_found_item(source_path, blank_after=False)
                 remux_single_media_file(source_path, output_file)
                 print_saved(output_file)
                 print()
