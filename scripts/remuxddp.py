@@ -24,6 +24,7 @@ Audio Encoding Specifications:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -636,10 +637,14 @@ def upload_media_file_to_gofile(file_to_upload: Path) -> str:
 
 def main() -> None:
     """Execute the primary remuxddp command-line workflow."""
-    if len(sys.argv) != 2 or sys.argv[1] in {"-h", "--help"}:
-        tool_name: str = Path(sys.argv[0]).name
-        print(f"Usage: {tool_name} <archive_url_or_media_file>")
-        sys.exit(0 if len(sys.argv) == 2 else 1)
+    parser = argparse.ArgumentParser(
+        description="Acquire media, remux audio to Dolby Digital Plus (E-AC-3), and upload"
+    )
+    parser.add_argument(
+        "source",
+        help="URL, archive, or media file to process.",
+    )
+    args: argparse.Namespace = parser.parse_args()
 
     started: float = time.monotonic()
     print_script_intro(
@@ -648,7 +653,7 @@ def main() -> None:
         detail="Converts FLAC, DTS, TrueHD, ALAC, and AAC audio to E-AC-3.",
     )
 
-    input_arg: str = sys.argv[1]
+    input_arg: str = args.source
     DOWNLOADS_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
