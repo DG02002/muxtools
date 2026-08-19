@@ -41,19 +41,8 @@ from typing import Final, NoReturn, TypedDict
 # --------------------------------------------------
 
 VERSION: Final[int] = 1
-
-COPY_AUDIO_CODECS: Final[frozenset[str]] = frozenset({
-    "aac",
-    "alac",
-    "ac3",
-    "eac3",
-    "mp3",
-})
-FALLBACK_AUDIO_CODEC: Final[str] = "alac"
 TEMP_DIR_PREFIX: Final[str] = ".quickmp4-gpac-"
-RE_REMUX_MP4_SUFFIX: Final[str] = ".quicktime.mp4"
 FOLDER_OUTPUT_SUFFIX: Final[str] = ".quickmp4"
-
 
 # --------------------------------------------------
 # Stream Metadata Types
@@ -226,8 +215,9 @@ def probe_media_streams_with_ffprobe(source_path: Path) -> list[Stream]:
 
 def generate_default_output_path(source_path: Path) -> Path:
     """Generate default output path with .mp4 extension."""
+    re_remux_mp4_suffix: str = ".quicktime.mp4"
     suffix: str = (
-        RE_REMUX_MP4_SUFFIX if source_path.suffix.lower() == ".mp4" else ".mp4"
+        re_remux_mp4_suffix if source_path.suffix.lower() == ".mp4" else ".mp4"
     )
     return source_path.with_suffix(suffix)
 
@@ -347,15 +337,23 @@ def construct_gpac_remux_command(
         stream for stream in streams if stream.get("codec_type") == "audio"
     ]
     if audio_streams:
+        copy_audio_codecs: frozenset[str] = frozenset({
+            "aac",
+            "alac",
+            "ac3",
+            "eac3",
+            "mp3",
+        })
+        fallback_audio_codec: str = "alac"
         needs_audio_transcode: bool = any(
-            str(object=stream.get("codec_name", "")).lower() not in COPY_AUDIO_CODECS
+            str(object=stream.get("codec_name", "")).lower() not in copy_audio_codecs
             for stream in audio_streams
         )
         if needs_audio_transcode:
             ccp_codecs: str = ",".join(
-                sorted(c for c in COPY_AUDIO_CODECS if c != FALLBACK_AUDIO_CODEC)
+                sorted(c for c in copy_audio_codecs if c != fallback_audio_codec)
             )
-            command.append(f"c={FALLBACK_AUDIO_CODEC}:ccp={ccp_codecs}")
+            command.append(f"c={fallback_audio_codec}:ccp={ccp_codecs}")
 
     # Note: GPAC demuxer converts embedded text subtitles (SRT, ASS, WebVTT)
     # directly to QuickTime Timed Text (tx3g) for the MP4 multiplexer.

@@ -38,15 +38,6 @@ from typing import Final, NoReturn, TypedDict
 
 VERSION: Final[int] = 1
 
-COPY_AUDIO_CODECS: Final[frozenset[str]] = frozenset({
-    "aac",
-    "alac",
-    "ac3",
-    "eac3",
-    "mp3",
-})
-FALLBACK_AUDIO_CODEC: Final[str] = "alac"
-
 TEXT_SUBTITLE_CODECS: Final[frozenset[str]] = frozenset({
     "mov_text",
     "subrip",
@@ -84,7 +75,6 @@ MP4_BRAND: Final[str] = "mp42"
 MP4_STRICTNESS: Final[str] = "unofficial"
 
 TEMP_DIR_PREFIX: Final[str] = ".quickmp4-"
-RE_REMUX_MP4_SUFFIX: Final[str] = ".quicktime.mp4"
 FOLDER_OUTPUT_SUFFIX: Final[str] = ".quickmp4"
 
 
@@ -284,8 +274,9 @@ def determine_quicktime_video_tag(video_stream: Stream) -> str:
 
 def generate_default_output_path(source_path: Path) -> Path:
     """Generate default output path with .mp4 extension."""
+    re_remux_mp4_suffix: str = ".quicktime.mp4"
     suffix: str = (
-        RE_REMUX_MP4_SUFFIX if source_path.suffix.lower() == ".mp4" else ".mp4"
+        re_remux_mp4_suffix if source_path.suffix.lower() == ".mp4" else ".mp4"
     )
     return source_path.with_suffix(suffix)
 
@@ -345,6 +336,15 @@ def construct_ffmpeg_remux_command(
     audio_index: int = 0
     subtitle_index: int = 0
 
+    copy_audio_codecs: frozenset[str] = frozenset({
+        "aac",
+        "alac",
+        "ac3",
+        "eac3",
+        "mp3",
+    })
+    fallback_audio_codec: str = "alac"
+
     for stream in streams:
         codec_type: str = str(object=stream.get("codec_type", ""))
         codec_name: str = str(object=stream.get("codec_name", ""))
@@ -352,7 +352,7 @@ def construct_ffmpeg_remux_command(
 
         if codec_type == "audio":
             audio_codec: str = (
-                "copy" if codec_name in COPY_AUDIO_CODECS else FALLBACK_AUDIO_CODEC
+                "copy" if codec_name in copy_audio_codecs else fallback_audio_codec
             )
             command.extend([
                 "-map",
