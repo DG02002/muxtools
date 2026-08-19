@@ -369,8 +369,6 @@ def construct_gpac_remux_command(
     # - chapm=both: Emits chapters as both a QuickTime text track and udta.chpl user-data atom
     # - itags=strict: Filters metadata tags to recognized Apple iTunes metadata keys
     # - ase=v0: Uses standard v0 audio sample entry signaling for multichannel compatibility
-    # - ctmode=noedit: Disables edit-list timestamp offsets to prevent corrupted track durations
-    #   (e.g., 0xFFFFFFFF / 1988h duration overflow on non-zero start timestamps or B-pyramids)
     #
     # CRITICAL MULTIPLEXER PLACEMENT:
     # 'mp4mx:<opts>' MUST be declared explicitly as a discrete filter before '-o <path>'.
@@ -381,7 +379,7 @@ def construct_gpac_remux_command(
     mp4_brand: Final[str] = "mp42"
     mp4mx_opts: str = (
         f"store=fstart:xps_inband=no:forcesync:styp={mp4_brand}:"
-        "chapm=both:itags=strict:ase=v0:ctmode=noedit"
+        "chapm=both:itags=strict:ase=v0"
     )
     command.extend([f"mp4mx:{mp4mx_opts}", "-o", str(output_path)])
     return command
