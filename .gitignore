@@ -28,3 +28,7 @@ temp/
 .muxflow-*/
 .quickmp4-*/
 .quickmp4-gpac-*/
+
+# Project directories
+!/scripts/
+!/scripts/**
