@@ -43,6 +43,7 @@ from typing import Any, Final, NoReturn
 VERSION: Final[int] = 1
 TEMP_DIRECTORY_PREFIX: Final[str] = ".quickmp4-"
 FOLDER_OUTPUT_SUFFIX: Final[str] = ".quickmp4"
+FFPROBE_TIMEOUT_SECONDS: Final[int] = 60
 
 SUPPORTED_MEDIA_EXTENSIONS: Final[frozenset[str]] = frozenset({
     ".mkv",
@@ -136,12 +137,19 @@ def probe_media_streams(source_file_path: Path) -> list[dict[str, Any]]:
         str(source_file_path),
     ]
 
-    process_result: subprocess.CompletedProcess[str] = subprocess.run(
-        probe_command,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        process_result: subprocess.CompletedProcess[str] = subprocess.run(
+            probe_command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=FFPROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        exit_with_error(
+            f"ffprobe didn't respond within {FFPROBE_TIMEOUT_SECONDS} seconds "
+            f"for '{source_file_path.name}'."
+        )
 
     if process_result.returncode != 0:
         error_output: str = process_result.stderr.strip()
@@ -182,6 +190,19 @@ def extract_dolby_vision_profile(video_stream: dict[str, Any]) -> int | None:
     return None
 
 
+def find_primary_video_stream(
+    streams: Sequence[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Locate the primary video stream, ignoring attached pictures / cover art."""
+    stream: dict[str, Any]
+    for stream in streams:
+        if stream.get("codec_type") == "video" and not stream.get(
+            "disposition", {}
+        ).get("attached_pic"):
+            return stream
+    return None
+
+
 # ----------------------------------------------------------------------
 # Step 2: Build GPAC Remux Command
 # ----------------------------------------------------------------------
@@ -191,25 +212,11 @@ def build_gpac_command(
     source_file_path: Path,
     output_file_path: Path,
     streams: Sequence[dict[str, Any]],
+    video_stream: dict[str, Any],
     verbose: bool = False,
 ) -> list[str]:
     """Construct the complete GPAC command for Apple QuickTime compatible MP4 muxing."""
     gpac_executable: str = find_required_tool("gpac")
-
-    # Locate primary video stream (ignore attached picture / cover art)
-    video_stream: dict[str, Any] | None = None
-    stream: dict[str, Any]
-    for stream in streams:
-        if stream.get("codec_type") == "video" and not stream.get(
-            "disposition", {}
-        ).get("attached_pic"):
-            video_stream: dict[str, Any] = stream
-            break
-
-    if not video_stream:
-        exit_with_error(
-            f"No valid video stream was found in '{source_file_path.name}'."
-        )
 
     command: list[str] = [gpac_executable]
     if not verbose:
@@ -299,6 +306,11 @@ def remux_file(
 
     output_file_path.parent.mkdir(parents=True, exist_ok=True)
     stream_metadata: list[dict[str, Any]] = probe_media_streams(source_file_path)
+    video_stream: dict[str, Any] | None = find_primary_video_stream(stream_metadata)
+    if video_stream is None:
+        exit_with_error(
+            f"No valid video stream was found in '{source_file_path.name}'."
+        )
 
     # Use a temporary directory adjacent to the destination to ensure atomic rename
     with tempfile.TemporaryDirectory(
@@ -306,7 +318,11 @@ def remux_file(
     ) as temporary_directory:
         temporary_output_path: Path = Path(temporary_directory) / output_file_path.name
         gpac_command: list[str] = build_gpac_command(
-            source_file_path, temporary_output_path, stream_metadata, verbose
+            source_file_path,
+            temporary_output_path,
+            stream_metadata,
+            video_stream,
+            verbose,
         )
 
         print(shlex.join(gpac_command))
@@ -320,6 +336,14 @@ def remux_file(
                 f"(exit code {process_result.returncode})."
             )
 
+        if (
+            not temporary_output_path.is_file()
+            or temporary_output_path.stat().st_size == 0
+        ):
+            exit_with_error(
+                f"GPAC didn't produce an output file for '{source_file_path.name}'."
+            )
+
         os.replace(temporary_output_path, output_file_path)
 
 
@@ -328,8 +352,8 @@ def remux_file(
 # ----------------------------------------------------------------------
 
 
-def determine_default_mp4_path(source_path: Path) -> Path:
-    """Generate default output path with .mp4 or .quicktime.mp4 extension."""
+def mp4_output_path_for(source_path: Path) -> Path:
+    """Generate output path with .mp4 or .quicktime.mp4 extension."""
     target_suffix: str = (
         ".quicktime.mp4" if source_path.suffix.lower() == ".mp4" else ".mp4"
     )
@@ -352,10 +376,10 @@ def resolve_file_job(
 ) -> tuple[Path, Path]:
     """Resolve destination path for a single input file."""
     if output_destination is None:
-        return source_file, determine_default_mp4_path(source_file)
+        return source_file, mp4_output_path_for(source_file)
 
     if has_multiple_inputs:
-        relative_target: Path = determine_default_mp4_path(Path(source_file.name))
+        relative_target: Path = mp4_output_path_for(Path(source_file.name))
         return source_file, output_destination / relative_target
 
     return source_file, output_destination
@@ -387,14 +411,13 @@ def resolve_folder_jobs(
 
     discovered_files: list[Path] = collect_media_files_from_directory(source_folder)
     if not discovered_files:
-        print_error(f"No supported media files were found in {source_folder}.")
-        return []
+        exit_with_error(f"No supported media files were found in {source_folder}.")
 
     folder_jobs: list[tuple[Path, Path]] = []
     media_file: Path
     for media_file in discovered_files:
         relative_path: Path = media_file.relative_to(source_folder)
-        target_path: Path = destination_folder / determine_default_mp4_path(relative_path)
+        target_path: Path = destination_folder / mp4_output_path_for(relative_path)
         folder_jobs.append((media_file, target_path))
 
     return folder_jobs
@@ -472,8 +495,6 @@ def main() -> None:
         remux_jobs: list[tuple[Path, Path]] = plan_remux_jobs(
             arguments.sources, arguments.output
         )
-        if not remux_jobs:
-            exit_with_error("No media files were found to process.")
 
         total_jobs: int = len(remux_jobs)
         index: int
@@ -493,6 +514,10 @@ def main() -> None:
             if total_jobs > 1 and target_file.exists():
                 print(f"{ANSI_YELLOW}Skipped{ANSI_RESET} [{target_file}]")
                 continue
+
+            # Single-file mode replaces an existing destination on purpose.
+            if total_jobs == 1 and target_file.exists():
+                print(f"{ANSI_YELLOW}Overwriting{ANSI_RESET} [{target_file}]")
 
             remux_file(source_file, target_file, arguments.verbose)
             print(f"{ANSI_GREEN}Saved {target_file}{ANSI_RESET}")

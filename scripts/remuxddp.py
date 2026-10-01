@@ -143,6 +143,7 @@ VIDEO_AND_HDR_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(
 )
 
 TEMP_DIR_PREFIX: Final[str] = "remuxddp-"
+FFPROBE_TIMEOUT_SECONDS: Final[int] = 60
 EXTRACTED_FOLDER_SUFFIX: Final[str] = ".EXTRACTED"
 OUTPUT_FOLDER_SUFFIX: Final[str] = ".FFMPEG"
 
@@ -338,12 +339,19 @@ def probe_media_streams_with_ffprobe(media_path: Path) -> list[Stream]:
         str(media_path),
     ]
 
-    result: subprocess.CompletedProcess[str] = subprocess.run(
-        args=command,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result: subprocess.CompletedProcess[str] = subprocess.run(
+            args=command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=FFPROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        exit_with_error(
+            f"ffprobe didn't respond within {FFPROBE_TIMEOUT_SECONDS} seconds "
+            f"for '{media_path.name}'."
+        )
     if result.returncode != 0:
         error_message: str = result.stderr.strip()
         exit_with_error(
@@ -406,6 +414,67 @@ def determine_eac3_bit_rate_by_channel_count(channels: int) -> str:
     return EAC3_CHANNEL_PROFILES.get(channels, DEFAULT_EAC3_PROFILE)[1]
 
 
+def build_ddp_tag_string(audio_streams: Sequence[Stream], converted: set[str]) -> str:
+    """Build the DDP<layout> tags for the converted audio streams."""
+    layouts: list[str] = []
+    for stream in audio_streams:
+        codec_name: str = stream.get("codec_name", "").lower()
+        if codec_name in converted:
+            channels_count: int = stream.get("channels", 0)
+            layout: str | None = EAC3_CHANNEL_PROFILES.get(
+                channels_count, DEFAULT_EAC3_PROFILE
+            )[0]
+            tag: str = f"DDP{layout}" if layout else "DDP"
+            if tag not in layouts:
+                layouts.append(tag)
+    return ".".join(layouts or ["DDP"])
+
+
+def determine_title_end(stem: str) -> int:
+    """Find where the title ends: after the first episode marker or release year."""
+    episode_or_year_matches: list[re.Match[str]] = [
+        match
+        for match in EPISODE_OR_YEAR_PATTERN.finditer(stem)
+        if match.start() > 0
+    ]
+    return episode_or_year_matches[0].end() if episode_or_year_matches else 1
+
+
+def insert_ddp_tag(stem: str, tag_str: str, title_end: int) -> str:
+    """Insert a DDP tag at the appropriate release-metadata position in a stem."""
+    pre_matches: list[re.Match[str]] = list(
+        PRE_AUDIO_TECH_PATTERN.finditer(stem, pos=title_end)
+    )
+    search_pos: int = pre_matches[-1].end() if pre_matches else title_end
+    video_match: re.Match[str] | None = VIDEO_AND_HDR_TOKEN_PATTERN.search(
+        stem, pos=search_pos
+    )
+
+    if video_match:
+        insert_pos: int = video_match.start()
+        if insert_pos > 0 and stem[insert_pos - 1] in "[(":
+            insert_pos -= 1
+        sep: str = " " if insert_pos > 0 and stem[insert_pos - 1] == " " else "."
+        prefix: str = stem[:insert_pos].rstrip(" ._-")
+        suffix: str = stem[insert_pos:]
+        if prefix:
+            return f"{prefix}{sep}{tag_str}{sep}{suffix}"
+        return f"{tag_str}{sep}{suffix}"
+
+    if pre_matches:
+        insert_pos = pre_matches[-1].end()
+        while insert_pos < len(stem) and stem[insert_pos] in "])":
+            insert_pos += 1
+        sep = " " if (" " in stem and "." not in stem) else "."
+        return f"{stem[:insert_pos]}{sep}{tag_str}{stem[insert_pos:]}"
+
+    group_match: re.Match[str] | None = re.search(r"(-[A-Za-z0-9]+)$", stem)
+    if group_match and group_match.start() >= title_end:
+        return f"{stem[:group_match.start()]}.{tag_str}{group_match.group(1)}"
+    sep = " " if (" " in stem and "." not in stem) else "."
+    return f"{stem}{sep}{tag_str}"
+
+
 def generate_ddp_remuxed_filename(
     source_path: Path, audio_streams: Sequence[Stream]
 ) -> str:
@@ -431,68 +500,8 @@ def generate_ddp_remuxed_filename(
     #    at the appropriate release-metadata position.
     has_ddp: bool = bool(EXISTING_DDP_PATTERN.search(stem))
     if stem == original_stem and not has_ddp:
-        layouts: list[str] = []
-        for stream in audio_streams:
-            codec_name: str = stream.get("codec_name", "").lower()
-            if codec_name in converted:
-                channels_count: int = stream.get("channels", 0)
-                layout: str | None = EAC3_CHANNEL_PROFILES.get(
-                    channels_count, DEFAULT_EAC3_PROFILE
-                )[0]
-                tag: str = f"DDP{layout}" if layout else "DDP"
-                if tag not in layouts:
-                    layouts.append(tag)
-
-        tag_str: str = ".".join(layouts or ["DDP"])
-
-        episode_or_year_matches: list[re.Match[str]] = [
-            match
-            for match in EPISODE_OR_YEAR_PATTERN.finditer(stem)
-            if match.start() > 0
-        ]
-        title_end: int = (
-            episode_or_year_matches[0].end() if episode_or_year_matches else 1
-        )
-
-        pre_matches: list[re.Match[str]] = list(
-            PRE_AUDIO_TECH_PATTERN.finditer(stem, pos=title_end)
-        )
-        min_pos: int = pre_matches[-1].end() if pre_matches else title_end
-        video_match: re.Match[str] | None = VIDEO_AND_HDR_TOKEN_PATTERN.search(
-            stem, pos=min_pos
-        )
-
-        if video_match:
-            insert_pos: int = video_match.start()
-            if insert_pos > 0 and stem[insert_pos - 1] in "[(":
-                insert_pos -= 1
-            sep: str = " " if insert_pos > 0 and stem[insert_pos - 1] == " " else "."
-            prefix: str = stem[:insert_pos].rstrip(" ._-")
-            suffix: str = stem[insert_pos:]
-            stem = (
-                f"{prefix}{sep}{tag_str}{sep}{suffix}"
-                if prefix
-                else f"{tag_str}{sep}{suffix}"
-            )
-        elif pre_matches:
-            insert_pos = pre_matches[-1].end()
-            while insert_pos < len(stem) and stem[insert_pos] in "])":
-                insert_pos += 1
-            sep = " " if (" " in stem and "." not in stem) else "."
-            prefix = stem[:insert_pos]
-            suffix = stem[insert_pos:]
-            stem = f"{prefix}{sep}{tag_str}{suffix}"
-        else:
-            group_match: re.Match[str] | None = re.search(
-                r"(-[A-Za-z0-9]+)$", stem
-            )
-            if group_match and group_match.start() >= title_end:
-                stem = (
-                    f"{stem[:group_match.start()]}.{tag_str}{group_match.group(1)}"
-                )
-            else:
-                sep = " " if (" " in stem and "." not in stem) else "."
-                stem = f"{stem}{sep}{tag_str}"
+        tag_str: str = build_ddp_tag_string(audio_streams, converted)
+        stem = insert_ddp_tag(stem, tag_str, determine_title_end(stem))
 
     return f"{stem}.mkv"
 
@@ -592,6 +601,11 @@ def remux_single_media_file(
         else probe_media_streams_with_ffprobe(source_path)
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        exit_with_error(
+            f"The output file already exists: {output_path}. "
+            "Two inputs may map to the same output name."
+        )
     command: list[str] = construct_ffmpeg_ddp_remux_command(
         source_path=source_path,
         output_path=output_path,
@@ -689,9 +703,6 @@ def create_tar_archive_from_folder(folder_path: Path) -> Path:
 
 def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Path:
     """Download a file using aria2c or curl."""
-    before: set[Path] = (
-        set(destination_folder.iterdir()) if destination_folder.exists() else set()
-    )
     aria2c: str | None = shutil.which("aria2c")
     curl: str | None = shutil.which("curl")
 
@@ -720,13 +731,20 @@ def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Pa
         exit_with_error(f"Download failed with exit code {result.returncode}.")
 
     print()
-    after: set[Path] = set(destination_folder.iterdir())
-    new_files: list[Path] = [
-        path for path in after - before if not path.name.endswith(".aria2")
+    downloaded_files: list[Path] = [
+        path
+        for path in destination_folder.iterdir()
+        if not path.name.endswith(".aria2")
     ]
-    if not new_files:
+    if not downloaded_files:
         exit_with_error("No file was downloaded.")
-    return min(new_files)
+    if len(downloaded_files) > 1:
+        file_names: str = ", ".join(path.name for path in sorted(downloaded_files))
+        exit_with_error(
+            "The download produced more than one file "
+            f"({file_names}); can't tell which one to process."
+        )
+    return downloaded_files[0]
 
 
 def upload_media_file_to_bzzhr(file_to_upload: Path) -> str:
@@ -786,6 +804,81 @@ def create_output_folder(working_folder: Path, base_name: str) -> Path:
     return output_folder
 
 
+def acquire_source_path(input_arg: str, working_folder: Path) -> Path:
+    """Resolve the input argument to a local source path, downloading if needed."""
+    parsed: urllib.parse.ParseResult = urllib.parse.urlparse(input_arg)
+
+    if parsed.scheme in {"http", "https"}:
+        downloaded_path: Path = download_remote_file_with_fallback(
+            input_arg, working_folder
+        )
+        print_saved(downloaded_path)
+        print()
+        return downloaded_path
+
+    local_path: Path = Path(input_arg).expanduser()
+    if not local_path.exists():
+        if parsed.scheme:
+            exit_with_error(
+                f"Unsupported URL scheme '{parsed.scheme}:'. "
+                "Use http://, https://, or a local file path."
+            )
+        exit_with_error(f"The file wasn't found: {local_path}.")
+
+    # Local inputs are read in place; only outputs are written to the temp folder.
+    print_found_item(local_path)
+    print_heading("Using local input")
+    print()
+    return local_path
+
+
+def process_single_media_file(source_path: Path, working_folder: Path) -> Path:
+    """Remux one media file and return the output file to upload."""
+    streams, audio_streams = probe_and_select_audio_streams(source_path)
+    output_folder: Path = create_output_folder(working_folder, source_path.stem)
+    output_file: Path = output_folder / generate_ddp_remuxed_filename(
+        source_path, audio_streams
+    )
+    print_heading("Remuxing")
+    print_found_item(source_path, blank_after=False)
+    remux_single_media_file(source_path, output_file, streams=streams)
+    print_saved(output_file)
+    print()
+    return output_file
+
+
+def process_media_archive(archive_path: Path, working_folder: Path) -> Path:
+    """Extract an archive, remux each media file, and return the repacked TAR."""
+    extracted_folder: Path = safely_extract_media_archive(archive_path, working_folder)
+    output_folder: Path = create_output_folder(working_folder, extracted_folder.name)
+
+    media_files_list: list[Path] = sorted(
+        path
+        for path in extracted_folder.rglob("*")
+        if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
+    )
+    if not media_files_list:
+        exit_with_error("No media files were found in the archive.")
+
+    print()
+    print_heading("Remuxing")
+    total_media_files: int = len(media_files_list)
+    # One unreadable file aborts the whole run on purpose: a partial archive
+    # must never be uploaded.
+    for position, file_path in enumerate(media_files_list, 1):
+        file_streams, file_audio = probe_and_select_audio_streams(file_path)
+        relative_path: Path = file_path.relative_to(extracted_folder).with_name(
+            generate_ddp_remuxed_filename(file_path, file_audio)
+        )
+        output_path: Path = output_folder / relative_path
+        print_batch_item(position, total_media_files, file_path)
+        remux_single_media_file(file_path, output_path, streams=file_streams)
+        print_saved(output_path)
+        print()
+
+    return create_tar_archive_from_folder(output_folder)
+
+
 def main() -> None:
     """Execute the primary remuxddp command-line workflow."""
     parser = argparse.ArgumentParser(
@@ -813,87 +906,25 @@ def main() -> None:
         ) as temporary_folder:
             working_folder: Path = Path(temporary_folder)
             print_working_folder(working_folder)
-            parsed: urllib.parse.ParseResult = urllib.parse.urlparse(input_arg)
 
-            # Acquire input
-            source_path: Path
-            if parsed.scheme in {"http", "https"}:
-                source_path = download_remote_file_with_fallback(
-                    input_arg, working_folder
-                )
-                print_saved(source_path)
-                print()
+            source_path: Path = acquire_source_path(input_arg, working_folder)
+            is_archive: bool = source_path.name.lower().endswith(_ARCHIVE_EXTENSIONS)
+
+            if is_archive:
+                upload_target: Path = process_media_archive(source_path, working_folder)
             else:
-                local: Path = Path(input_arg).expanduser()
-                if not local.exists():
-                    exit_with_error(f"The file wasn't found: {local}.")
-                source_path = working_folder / local.name
-                print_found_item(local)
-                print_heading("Using local input")
-                shutil.copy2(local, source_path)
-                print_saved(source_path)
-                print()
-
-            lower_name: str = source_path.name.lower()
-            is_archive: bool = lower_name.endswith(_ARCHIVE_EXTENSIONS)
-
-            # Process input
-            upload_target: Path
-            if not is_archive:
-                streams, audio_streams = probe_and_select_audio_streams(source_path)
-                output_folder: Path = create_output_folder(
-                    working_folder, source_path.stem
-                )
-                output_file: Path = output_folder / generate_ddp_remuxed_filename(
-                    source_path, audio_streams
-                )
-                print_heading("Remuxing")
-                print_found_item(source_path, blank_after=False)
-                remux_single_media_file(source_path, output_file, streams=streams)
-                print_saved(output_file)
-                print()
-                upload_target = output_file
-            else:
-                extracted_folder: Path = safely_extract_media_archive(
+                upload_target = process_single_media_file(
                     source_path, working_folder
                 )
-                output_folder = create_output_folder(
-                    working_folder, extracted_folder.name
-                )
 
-                media_files_list: list[Path] = sorted(
-                    path
-                    for path in extracted_folder.rglob("*")
-                    if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
-                )
-                if not media_files_list:
-                    exit_with_error("No media files were found in the archive.")
-
-                print()
-                print_heading("Remuxing")
-                total_media_files: int = len(media_files_list)
-                for position, file_path in enumerate(media_files_list, 1):
-                    file_streams, file_audio = probe_and_select_audio_streams(file_path)
-                    relative_path: Path = file_path.relative_to(
-                        extracted_folder
-                    ).with_name(generate_ddp_remuxed_filename(file_path, file_audio))
-                    output_path: Path = output_folder / relative_path
-                    print_batch_item(position, total_media_files, file_path)
-                    remux_single_media_file(
-                        file_path, output_path, streams=file_streams
-                    )
-                    print_saved(output_path)
-                    print()
-
-                upload_target = create_tar_archive_from_folder(output_folder)
-
-            # Upload
             download_page: str = upload_media_file_to_bzzhr(upload_target)
             print_uploaded(download_page)
             print_elapsed(time.monotonic() - started)
     except KeyboardInterrupt:
         print_canceled()
         sys.exit(130)
+    except OSError as error:
+        exit_with_error(f"Filesystem error: {error}")
 
 
 if __name__ == "__main__":
