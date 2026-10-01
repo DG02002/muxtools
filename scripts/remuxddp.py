@@ -206,7 +206,6 @@ class BzzhrResponse(TypedDict, total=False):
 ANSI_BOLD: Final[str] = "\033[1m"
 ANSI_DIM: Final[str] = "\033[2m"
 ANSI_GREEN: Final[str] = "\033[32m"
-ANSI_GREEN_BOLD: Final[str] = "\033[1;32m"
 ANSI_CYAN_BOLD: Final[str] = "\033[1;36m"
 ANSI_YELLOW: Final[str] = "\033[33m"
 ANSI_RED: Final[str] = "\033[31m"
@@ -356,7 +355,6 @@ def probe_media_streams_with_ffprobe(media_path: Path) -> list[Stream]:
         return data.get("streams", [])
     except json.JSONDecodeError:
         exit_with_error(f"Unable to parse ffprobe JSON output for '{media_path.name}'.")
-        return []
 
 
 # --------------------------------------------------
@@ -378,17 +376,34 @@ def select_audio_streams(streams: Sequence[Stream]) -> list[Stream]:
     return selected_audio_streams or all_audio_streams
 
 
+def probe_and_select_audio_streams(
+    media_path: Path,
+) -> tuple[list[Stream], list[Stream]]:
+    """Probe a media file and select its audio streams, exiting when none exist."""
+    streams: list[Stream] = probe_media_streams_with_ffprobe(media_path)
+    audio_streams: list[Stream] = select_audio_streams(streams)
+    if not audio_streams:
+        exit_with_error(f"No audio streams were found in '{media_path.name}'.")
+    return streams, audio_streams
+
+
+# E-AC-3 encoding profile (channel layout tag, bit rate) per channel count.
+# Unlisted counts (3, 4, 5 channels) fall back to the stereo rate with no layout tag.
+EAC3_CHANNEL_PROFILES: Final[dict[int, tuple[str | None, str]]] = {
+    1: ("1.0", "224k"),
+    2: ("2.0", "224k"),
+    6: ("5.1", "640k"),
+}
+DEFAULT_EAC3_PROFILE: Final[tuple[str | None, str]] = (None, "224k")
+
+
 def determine_eac3_bit_rate_by_channel_count(channels: int) -> str:
     """Select bit rate for E-AC-3 based on audio channels."""
     if channels > 6:
         exit_with_error(
             f"The FFmpeg E-AC-3 encoder supports up to 6 channels ({channels} requested)."
         )
-    if channels == 6:
-        return "640k"
-    if channels == 1:
-        return "224k"
-    return "224k"
+    return EAC3_CHANNEL_PROFILES.get(channels, DEFAULT_EAC3_PROFILE)[1]
 
 
 def generate_ddp_remuxed_filename(
@@ -421,11 +436,9 @@ def generate_ddp_remuxed_filename(
             codec_name: str = stream.get("codec_name", "").lower()
             if codec_name in converted:
                 channels_count: int = stream.get("channels", 0)
-                layout: str | None = {
-                    1: "1.0",
-                    2: "2.0",
-                    6: "5.1",
-                }.get(channels_count)
+                layout: str | None = EAC3_CHANNEL_PROFILES.get(
+                    channels_count, DEFAULT_EAC3_PROFILE
+                )[0]
                 tag: str = f"DDP{layout}" if layout else "DDP"
                 if tag not in layouts:
                     layouts.append(tag)
@@ -759,12 +772,18 @@ def upload_media_file_to_bzzhr(file_to_upload: Path) -> str:
         return f"https://bzzhr.co/{file_id}"
     except json.JSONDecodeError:
         exit_with_error("Unable to parse bzzhr.co upload response.")
-        return ""
 
 
 # --------------------------------------------------
 # Main Workflow Execution
 # --------------------------------------------------
+
+
+def create_output_folder(working_folder: Path, base_name: str) -> Path:
+    """Create the .FFMPEG output folder inside the working folder."""
+    output_folder: Path = working_folder / f"{base_name}{OUTPUT_FOLDER_SUFFIX}"
+    output_folder.mkdir(parents=True, exist_ok=True)
+    return output_folder
 
 
 def main() -> None:
@@ -821,16 +840,10 @@ def main() -> None:
             # Process input
             upload_target: Path
             if not is_archive:
-                streams: list[Stream] = probe_media_streams_with_ffprobe(source_path)
-                audio_streams: list[Stream] = select_audio_streams(streams)
-                if not audio_streams:
-                    exit_with_error(
-                        f"No audio streams were found in '{source_path.name}'."
-                    )
-                output_folder: Path = (
-                    working_folder / f"{source_path.stem}{OUTPUT_FOLDER_SUFFIX}"
+                streams, audio_streams = probe_and_select_audio_streams(source_path)
+                output_folder: Path = create_output_folder(
+                    working_folder, source_path.stem
                 )
-                output_folder.mkdir(parents=True, exist_ok=True)
                 output_file: Path = output_folder / generate_ddp_remuxed_filename(
                     source_path, audio_streams
                 )
@@ -844,10 +857,9 @@ def main() -> None:
                 extracted_folder: Path = safely_extract_media_archive(
                     source_path, working_folder
                 )
-                output_folder = (
-                    working_folder / f"{extracted_folder.name}{OUTPUT_FOLDER_SUFFIX}"
+                output_folder = create_output_folder(
+                    working_folder, extracted_folder.name
                 )
-                output_folder.mkdir(parents=True, exist_ok=True)
 
                 media_files_list: list[Path] = sorted(
                     path
@@ -861,10 +873,7 @@ def main() -> None:
                 print_heading("Remuxing")
                 total_media_files: int = len(media_files_list)
                 for position, file_path in enumerate(media_files_list, 1):
-                    file_streams: list[Stream] = probe_media_streams_with_ffprobe(
-                        file_path
-                    )
-                    file_audio: list[Stream] = select_audio_streams(file_streams)
+                    file_streams, file_audio = probe_and_select_audio_streams(file_path)
                     relative_path: Path = file_path.relative_to(
                         extracted_folder
                     ).with_name(generate_ddp_remuxed_filename(file_path, file_audio))

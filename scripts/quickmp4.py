@@ -10,7 +10,7 @@ Specifications & Stream Handling:
         - FourCC tags: avc1 (H.264), hvc1 (HEVC), av01 (AV1), dvh1/dva1 (Dolby Vision)
         - Sync table: All SAP types indexed (forcesync)
     - Audio:
-        - Passthrough codecs: AAC, Apple Lossless (ALAC), AC-3, E-AC-3, MP3
+        - Passthrough codecs: AAC, Apple Lossless (ALAC), AC-3, E-AC-3, MP3, FLAC
         - Fallback codec: Apple Lossless (ALAC via c=alac)
     - Subtitles:
         - Text subtitles converted to QuickTime Timed Text (tx3g / mov_text)
@@ -90,10 +90,8 @@ def exit_with_error(message: str, exit_code: int = 1) -> NoReturn:
 
 def format_elapsed_time(seconds: float) -> str:
     """Format duration in seconds to a human-readable string (e.g., '1h 2m 3s')."""
-    total_seconds: int = max(0, round(number=seconds))
+    total_seconds: int = max(0, round(seconds))
     hours, remainder = divmod(total_seconds, 3600)
-    minutes: int
-    remaining_seconds: int
     minutes, remaining_seconds = divmod(remainder, 60)
 
     time_components: list[str] = []
@@ -113,17 +111,15 @@ def format_elapsed_time(seconds: float) -> str:
 
 def find_required_tool(binary_name: str) -> str:
     """Verify that an external binary exists in the system PATH."""
-    binary_path: str | None = shutil.which(cmd=binary_name)
+    binary_path: str | None = shutil.which(binary_name)
     if not binary_path:
-        exit_with_error(
-            message=f"The required tool '{binary_name}' was not found in PATH."
-        )
+        exit_with_error(f"The required tool '{binary_name}' was not found in PATH.")
     return binary_path
 
 
 def probe_media_streams(source_file_path: Path) -> list[dict[str, Any]]:
     """Inspect stream metadata from a media file using ffprobe."""
-    ffprobe_executable: str = find_required_tool(binary_name="ffprobe")
+    ffprobe_executable: str = find_required_tool("ffprobe")
 
     probe_command: list[str] = [
         ffprobe_executable,
@@ -137,11 +133,11 @@ def probe_media_streams(source_file_path: Path) -> list[dict[str, Any]]:
         ),
         "-of",
         "json",
-        str(object=source_file_path),
+        str(source_file_path),
     ]
 
     process_result: subprocess.CompletedProcess[str] = subprocess.run(
-        args=probe_command,
+        probe_command,
         capture_output=True,
         text=True,
         check=False,
@@ -150,7 +146,7 @@ def probe_media_streams(source_file_path: Path) -> list[dict[str, Any]]:
     if process_result.returncode != 0:
         error_output: str = process_result.stderr.strip()
         exit_with_error(
-            message=f"Unable to inspect '{source_file_path.name}' with ffprobe:\n{error_output}"
+            f"Unable to inspect '{source_file_path.name}' with ffprobe:\n{error_output}"
         )
 
     try:
@@ -158,7 +154,7 @@ def probe_media_streams(source_file_path: Path) -> list[dict[str, Any]]:
         return parsed_json.get("streams", [])
     except json.JSONDecodeError:
         exit_with_error(
-            message=f"Unable to parse ffprobe JSON output for '{source_file_path.name}'."
+            f"Unable to parse ffprobe JSON output for '{source_file_path.name}'."
         )
 
 
@@ -166,7 +162,7 @@ def extract_frame_rate(video_stream: dict[str, Any]) -> str | None:
     """Extract a valid rational frame rate string from video stream metadata."""
     rate_key: str
     for rate_key in ("r_frame_rate", "avg_frame_rate"):
-        rate_value: str = str(object=video_stream.get(rate_key, "")).strip()
+        rate_value: str = str(video_stream.get(rate_key, "")).strip()
         if rate_value and rate_value != "0/0" and "/" in rate_value:
             numerator: str
             denominator: str
@@ -198,7 +194,7 @@ def build_gpac_command(
     verbose: bool = False,
 ) -> list[str]:
     """Construct the complete GPAC command for Apple QuickTime compatible MP4 muxing."""
-    gpac_executable: str = find_required_tool(binary_name="gpac")
+    gpac_executable: str = find_required_tool("gpac")
 
     # Locate primary video stream (ignore attached picture / cover art)
     video_stream: dict[str, Any] | None = None
@@ -212,7 +208,7 @@ def build_gpac_command(
 
     if not video_stream:
         exit_with_error(
-            message=f"No valid video stream was found in '{source_file_path.name}'."
+            f"No valid video stream was found in '{source_file_path.name}'."
         )
 
     command: list[str] = [gpac_executable]
@@ -225,7 +221,7 @@ def build_gpac_command(
     command.extend(["-i", f"{source_file_path}{source_fps_property}"])
 
     # 1. Video Reframing (AVC / HEVC)
-    video_codec_name: str = str(object=video_stream.get("codec_name", "")).lower()
+    video_codec_name: str = str(video_stream.get("codec_name", "")).lower()
     if video_codec_name in {"h264", "hevc"}:
         video_filter_options: list[str] = []
 
@@ -257,14 +253,14 @@ def build_gpac_command(
     if audio_streams:
         fallback_audio_codec: str = "alac"
         needs_audio_transcode: bool = any(
-            str(object=stream.get("codec_name", "")).lower()
-            not in COMPATIBLE_AUDIO_CODECS
+            str(stream.get("codec_name", "")).lower() not in COMPATIBLE_AUDIO_CODECS
             for stream in audio_streams
         )
 
         if needs_audio_transcode:
-            # ccp (Codec Check Passthrough) copies compatible formats (AAC, AC-3, E-AC-3, MP3)
-            # while transcoding incompatible formats (FLAC, DTS, TrueHD, Opus) to ALAC.
+            # ccp (Codec Check Passthrough) copies compatible formats (AAC, AC-3,
+            # E-AC-3, MP3, FLAC) while transcoding incompatible formats (DTS, TrueHD,
+            # Opus) to ALAC.
             passthrough_codecs_list: list[str] = sorted(
                 codec
                 for codec in COMPATIBLE_AUDIO_CODECS
@@ -284,7 +280,7 @@ def build_gpac_command(
     multiplexer_options: str = (
         "store=fstart:xps_inband=no:forcesync:styp=mp42:chapm=both:itags=strict:ase=v0"
     )
-    command.extend([f"mp4mx:{multiplexer_options}", "-o", str(object=output_file_path)])
+    command.extend([f"mp4mx:{multiplexer_options}", "-o", str(output_file_path)])
 
     return command
 
@@ -299,7 +295,7 @@ def remux_file(
 ) -> None:
     """Remux a single media file to MP4 using an atomic temporary directory write."""
     if not source_file_path.is_file():
-        exit_with_error(message=f"Input file not found: {source_file_path}")
+        exit_with_error(f"Input file not found: {source_file_path}")
 
     output_file_path.parent.mkdir(parents=True, exist_ok=True)
     stream_metadata: list[dict[str, Any]] = probe_media_streams(source_file_path)
@@ -310,24 +306,21 @@ def remux_file(
     ) as temporary_directory:
         temporary_output_path: Path = Path(temporary_directory) / output_file_path.name
         gpac_command: list[str] = build_gpac_command(
-            source_file_path=source_file_path,
-            output_file_path=temporary_output_path,
-            streams=stream_metadata,
-            verbose=verbose,
+            source_file_path, temporary_output_path, stream_metadata, verbose
         )
 
-        print(shlex.join(split_command=gpac_command))
+        print(shlex.join(gpac_command))
         process_result: subprocess.CompletedProcess[bytes] = subprocess.run(
-            args=gpac_command, check=False
+            gpac_command, check=False
         )
 
         if process_result.returncode != 0:
             exit_with_error(
-                message=f"Unable to remux '{source_file_path.name}' with GPAC "
+                f"Unable to remux '{source_file_path.name}' with GPAC "
                 f"(exit code {process_result.returncode})."
             )
 
-        os.replace(src=temporary_output_path, dst=output_file_path)
+        os.replace(temporary_output_path, output_file_path)
 
 
 # ----------------------------------------------------------------------
@@ -347,7 +340,7 @@ def collect_media_files_from_directory(directory_path: Path) -> list[Path]:
     """Recursively collect supported media files from a directory."""
     return sorted(
         path
-        for path in directory_path.rglob(pattern="*")
+        for path in directory_path.rglob("*")
         if path.is_file() and path.suffix.lower() in SUPPORTED_MEDIA_EXTENSIONS
     )
 
@@ -359,12 +352,10 @@ def resolve_file_job(
 ) -> tuple[Path, Path]:
     """Resolve destination path for a single input file."""
     if output_destination is None:
-        return source_file, determine_default_mp4_path(source_path=source_file)
+        return source_file, determine_default_mp4_path(source_file)
 
     if has_multiple_inputs:
-        relative_target: Path = determine_default_mp4_path(
-            source_path=Path(source_file.name)
-        )
+        relative_target: Path = determine_default_mp4_path(Path(source_file.name))
         return source_file, output_destination / relative_target
 
     return source_file, output_destination
@@ -377,13 +368,13 @@ def resolve_folder_jobs(
 ) -> list[tuple[Path, Path]]:
     """Resolve destination paths for all media files inside a directory."""
     if not source_folder.is_dir():
-        exit_with_error(message=f"Input is not a valid file or folder: {source_folder}")
+        exit_with_error(f"Input is not a valid file or folder: {source_folder}")
 
     destination_folder: Path = (
         output_destination / source_folder.name
         if output_destination and has_multiple_inputs
         else output_destination
-        or source_folder.with_name(name=f"{source_folder.name}{FOLDER_OUTPUT_SUFFIX}")
+        or source_folder.with_name(f"{source_folder.name}{FOLDER_OUTPUT_SUFFIX}")
     )
 
     resolved_destination: Path = destination_folder.resolve()
@@ -392,22 +383,18 @@ def resolve_folder_jobs(
         resolved_destination == resolved_source
         or resolved_source in resolved_destination.parents
     ):
-        exit_with_error(message="Output folder cannot be inside the input folder.")
+        exit_with_error("Output folder cannot be inside the input folder.")
 
-    discovered_files: list[Path] = collect_media_files_from_directory(
-        directory_path=source_folder
-    )
+    discovered_files: list[Path] = collect_media_files_from_directory(source_folder)
     if not discovered_files:
-        print_error(message=f"No supported media files were found in {source_folder}.")
+        print_error(f"No supported media files were found in {source_folder}.")
         return []
 
     folder_jobs: list[tuple[Path, Path]] = []
     media_file: Path
     for media_file in discovered_files:
         relative_path: Path = media_file.relative_to(source_folder)
-        target_path: Path = destination_folder / determine_default_mp4_path(
-            source_path=relative_path
-        )
+        target_path: Path = destination_folder / determine_default_mp4_path(relative_path)
         folder_jobs.append((media_file, target_path))
 
     return folder_jobs
@@ -424,22 +411,14 @@ def plan_remux_jobs(
     for source in sources:
         if source.is_file():
             remux_jobs.append(
-                resolve_file_job(
-                    source_file=source,
-                    output_destination=output_destination,
-                    has_multiple_inputs=has_multiple_inputs,
-                )
+                resolve_file_job(source, output_destination, has_multiple_inputs)
             )
         elif source.is_dir():
             remux_jobs.extend(
-                resolve_folder_jobs(
-                    source_folder=source,
-                    output_destination=output_destination,
-                    has_multiple_inputs=has_multiple_inputs,
-                )
+                resolve_folder_jobs(source, output_destination, has_multiple_inputs)
             )
         else:
-            exit_with_error(message=f"Input is not a valid file or folder: {source}")
+            exit_with_error(f"Input is not a valid file or folder: {source}")
 
     # Guard against accidental filename collisions in batch destinations
     all_destinations: list[Path] = [
@@ -447,7 +426,7 @@ def plan_remux_jobs(
     ]
     if len(all_destinations) != len(set(all_destinations)):
         exit_with_error(
-            message="Multiple inputs resolve to the same output file. Choose a unique output folder."
+            "Multiple inputs resolve to the same output file. Choose a unique output folder."
         )
 
     return remux_jobs
@@ -491,19 +470,16 @@ def main() -> None:
 
     try:
         remux_jobs: list[tuple[Path, Path]] = plan_remux_jobs(
-            sources=arguments.sources,
-            output_destination=arguments.output,
+            arguments.sources, arguments.output
         )
         if not remux_jobs:
-            exit_with_error(message="No media files were found to process.")
+            exit_with_error("No media files were found to process.")
 
         total_jobs: int = len(remux_jobs)
         index: int
         source_file: Path
         target_file: Path
-        for index, (source_file, target_file) in enumerate(
-            iterable=remux_jobs, start=1
-        ):
+        for index, (source_file, target_file) in enumerate(remux_jobs, 1):
             batch_prefix: str = (
                 f"{ANSI_BOLD}({index}/{total_jobs}){ANSI_RESET} "
                 if total_jobs > 1
@@ -518,16 +494,10 @@ def main() -> None:
                 print(f"{ANSI_YELLOW}Skipped{ANSI_RESET} [{target_file}]")
                 continue
 
-            remux_file(
-                source_file_path=source_file,
-                output_file_path=target_file,
-                verbose=arguments.verbose,
-            )
+            remux_file(source_file, target_file, arguments.verbose)
             print(f"{ANSI_GREEN}Saved {target_file}{ANSI_RESET}")
 
-        formatted_duration: str = format_elapsed_time(
-            seconds=time.monotonic() - start_time
-        )
+        formatted_duration: str = format_elapsed_time(time.monotonic() - start_time)
         print(f"{ANSI_DIM}Completed in {formatted_duration}{ANSI_RESET}")
 
     except KeyboardInterrupt:
