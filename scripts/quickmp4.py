@@ -84,7 +84,7 @@ def exit_with_error(message: str, exit_code: int = 1) -> NoReturn:
     sys.exit(exit_code)
 
 
-def format_elapsed_time(seconds: float) -> str:
+def format_duration(seconds: float) -> str:
     """Format duration in seconds to a human-readable string (e.g., '1h 2m 3s')."""
     total_seconds: int = max(0, round(seconds))
     hours, remainder = divmod(total_seconds, 3600)
@@ -100,6 +100,27 @@ def format_elapsed_time(seconds: float) -> str:
     return " ".join(time_components)
 
 
+def print_stage_times(
+    stage_times: Sequence[tuple[str, float]], total_seconds: float
+) -> None:
+    """Print the end-of-run per-file time report table."""
+    durations: list[str] = [format_duration(seconds) for _, seconds in stage_times]
+    total_text: str = format_duration(total_seconds)
+    label_width: int = max([len(label) for label, _ in stage_times] + [len("Total")])
+    duration_width: int = max([len(text) for text in durations] + [len(total_text)])
+
+    print()
+    print(f"{ANSI_BOLD}Time report{ANSI_RESET}")
+    for (label, _), duration_text in zip(stage_times, durations):
+        print(f"  {label:<{label_width}}  {duration_text:>{duration_width}}")
+    rule: str = "-" * (label_width + duration_width + 2)
+    print(f"{ANSI_DIM}  {rule}{ANSI_RESET}")
+    print(
+        f"{ANSI_BOLD}  {'Total':<{label_width}}  "
+        f"{total_text:>{duration_width}}{ANSI_RESET}"
+    )
+
+
 # ----------------------------------------------------------------------
 # Step 1: Media Inspection (ffprobe)
 # ----------------------------------------------------------------------
@@ -109,7 +130,7 @@ def find_required_tool(binary_name: str) -> str:
     """Verify that an external binary exists in the system PATH."""
     binary_path: str | None = shutil.which(binary_name)
     if not binary_path:
-        exit_with_error(f"The required tool '{binary_name}' was not found in PATH.")
+        exit_with_error(f"The required tool '{binary_name}' wasn't found in PATH.")
     return binary_path
 
 
@@ -353,10 +374,14 @@ def mp4_output_path_for(source_path: Path) -> Path:
 
 def collect_media_files_from_directory(directory_path: Path) -> list[Path]:
     """Recursively collect supported media files from a directory."""
+    # Skip macOS AppleDouble ("._foo.mkv") and other dotfiles; they match the
+    # media extension but are metadata, not media.
     return sorted(
         path
         for path in directory_path.rglob("*")
-        if path.is_file() and path.suffix.lower() in SUPPORTED_MEDIA_EXTENSIONS
+        if path.is_file()
+        and not path.name.startswith(".")
+        and path.suffix.lower() in SUPPORTED_MEDIA_EXTENSIONS
     )
 
 
@@ -476,6 +501,10 @@ def main() -> None:
     )
     arguments: argparse.Namespace = argument_parser.parse_args()
 
+    # Fail fast on missing tools before any remuxing starts.
+    for binary_name in ("ffprobe", "gpac"):
+        find_required_tool(binary_name)
+
     start_time: float = time.monotonic()
     print(
         f"\n{ANSI_BOLD}quickmp4 v{VERSION}{ANSI_RESET}: "
@@ -487,6 +516,7 @@ def main() -> None:
             arguments.sources, arguments.output
         )
 
+        stage_times: list[tuple[str, float]] = []
         total_jobs: int = len(remux_jobs)
         index: int
         source_file: Path
@@ -510,11 +540,12 @@ def main() -> None:
             if total_jobs == 1 and target_file.exists():
                 print(f"{ANSI_YELLOW}Overwriting{ANSI_RESET} [{target_file}]")
 
+            file_started: float = time.monotonic()
             remux_file(source_file, target_file, arguments.verbose)
+            stage_times.append((source_file.name, time.monotonic() - file_started))
             print(f"{ANSI_GREEN}Saved {target_file}{ANSI_RESET}")
 
-        formatted_duration: str = format_elapsed_time(time.monotonic() - start_time)
-        print(f"{ANSI_DIM}Completed in {formatted_duration}{ANSI_RESET}")
+        print_stage_times(stage_times, time.monotonic() - start_time)
 
     except KeyboardInterrupt:
         sys.stderr.write(

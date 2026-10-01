@@ -82,6 +82,8 @@ Process a local archive or media file directly:
 python3 scripts/remuxddp.py /path/to/archive.tar.gz
 ```
 
+Interrupted downloads are resumable: in-progress files live under `~/Downloads/remuxddp-partial/<url-hash>/` and survive failed or canceled runs, so re-running the script with the same URL picks up where the download left off. The folder is cleaned up automatically after a successful upload.
+
 ## Documentation
 
 - [QuickTime Player compatibility](quicktime-player-compatibility.md): Format compatibility table covering containers, video, audio, subtitles, and metadata

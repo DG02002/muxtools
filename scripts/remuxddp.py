@@ -37,7 +37,8 @@ import tempfile
 import time
 import urllib.parse
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Final, NoReturn, TypedDict
 
@@ -246,8 +247,8 @@ def print_saved(path: Path) -> None:
     print(f"{ANSI_GREEN}Saved {path}{ANSI_RESET}")
 
 
-def print_elapsed(seconds: float) -> None:
-    """Print the elapsed duration in a human-readable format."""
+def format_duration(seconds: float) -> str:
+    """Format seconds as a compact duration like '1h 2m 3s'."""
     rounded = max(0, round(seconds))
     hours, remainder = divmod(rounded, 3600)
     minutes, remaining_seconds = divmod(remainder, 60)
@@ -257,7 +258,36 @@ def print_elapsed(seconds: float) -> None:
     if minutes or hours:
         parts.append(f"{minutes}m")
     parts.append(f"{remaining_seconds}s")
-    print(f"{ANSI_DIM}Completed in {' '.join(parts)}{ANSI_RESET}")
+    return " ".join(parts)
+
+
+def print_stage_times(
+    stage_times: Sequence[tuple[str, float]], total_seconds: float
+) -> None:
+    """Print the end-of-run per-stage time report table."""
+    durations: list[str] = [format_duration(seconds) for _, seconds in stage_times]
+    total_text: str = format_duration(total_seconds)
+    label_width: int = max([len(label) for label, _ in stage_times] + [len("Total")])
+    duration_width: int = max([len(text) for text in durations] + [len(total_text)])
+
+    print()
+    print_heading("Time report")
+    for (label, _), duration_text in zip(stage_times, durations):
+        print(f"  {label:<{label_width}}  {duration_text:>{duration_width}}")
+    rule: str = "-" * (label_width + duration_width + 2)
+    print(f"{ANSI_DIM}  {rule}{ANSI_RESET}")
+    print(
+        f"{ANSI_BOLD}  {'Total':<{label_width}}  "
+        f"{total_text:>{duration_width}}{ANSI_RESET}"
+    )
+
+
+@contextmanager
+def timed_stage(label: str, stage_times: list[tuple[str, float]]) -> Iterator[None]:
+    """Time one pipeline stage for the end-of-run report."""
+    stage_started: float = time.monotonic()
+    yield
+    stage_times.append((label, time.monotonic() - stage_started))
 
 
 def exit_with_error(message: str, code: int = 1) -> NoReturn:
@@ -677,6 +707,11 @@ def create_tar_archive_from_folder(folder_path: Path) -> Path:
 # --------------------------------------------------
 
 
+def is_partial_download_artifact(path: Path) -> bool:
+    """True for aria2c control files and curl partials, never completed files."""
+    return path.name.endswith((".aria2", ".part"))
+
+
 def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Path:
     """Download a file using aria2c or curl."""
     aria2c: str | None = shutil.which("aria2c")
@@ -684,6 +719,7 @@ def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Pa
 
     print_heading("Downloading")
     command: list[str]
+    curl_partial_path: Path | None = None
     if aria2c:
         command = [
             aria2c,
@@ -698,7 +734,20 @@ def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Pa
             url,
         ]
     elif curl:
-        command = [curl, "-L", "-O", "--output-dir", str(destination_folder), url]
+        # curl keeps no control file, so download to a .part name (resumed by
+        # --continue-at on re-runs) that the reuse check in acquire_source_path
+        # can never mistake for a completed download.
+        final_name: str = Path(urllib.parse.urlparse(url).path).name or "download"
+        curl_partial_path = destination_folder / f"{final_name}.part"
+        command = [
+            curl,
+            "-L",
+            "--continue-at",
+            "-",
+            "-o",
+            str(curl_partial_path),
+            url,
+        ]
     else:
         exit_with_error("Install aria2 or curl to download files from URLs.")
 
@@ -709,11 +758,14 @@ def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Pa
     if result.returncode != 0:
         exit_with_error(f"Download failed with exit code {result.returncode}.")
 
+    if curl_partial_path is not None:
+        curl_partial_path.replace(curl_partial_path.with_suffix(""))
+
     print()
     downloaded_files: list[Path] = [
         path
         for path in destination_folder.iterdir()
-        if not path.name.endswith(".aria2")
+        if not is_partial_download_artifact(path)
     ]
     if not downloaded_files:
         exit_with_error("No file was downloaded.")
@@ -735,6 +787,9 @@ def upload_media_file_to_bzzhr(file_to_upload: Path) -> str:
     print_heading("Uploading")
     command: list[str] = [
         curl,
+        # Retries transient failures; safe because re-PUTs overwrite by name.
+        "--retry",
+        "3",
         "-o",
         "-",
         "-T",
@@ -793,13 +848,16 @@ def remove_partial_download(downloaded_path: Path) -> None:
     """Delete an uploaded download, keeping the folder only if partials remain."""
     downloaded_path.unlink(missing_ok=True)
     downloaded_path.with_name(f"{downloaded_path.name}.aria2").unlink(missing_ok=True)
+    downloaded_path.with_name(f"{downloaded_path.name}.part").unlink(missing_ok=True)
     try:
         downloaded_path.parent.rmdir()
     except OSError:
         pass
 
 
-def acquire_source_path(input_arg: str) -> tuple[Path, bool]:
+def acquire_source_path(
+    input_arg: str, stage_times: list[tuple[str, float]]
+) -> tuple[Path, bool]:
     """Resolve the input to a local path and whether it lives in the partial folder."""
     parsed: urllib.parse.ParseResult = urllib.parse.urlparse(input_arg)
 
@@ -813,7 +871,7 @@ def acquire_source_path(input_arg: str) -> tuple[Path, bool]:
         completed: list[Path] = [
             path
             for path in download_folder.iterdir()
-            if not path.name.endswith(".aria2")
+            if not is_partial_download_artifact(path)
         ]
         if len(completed) == 1 and not completed[0].with_name(
             f"{completed[0].name}.aria2"
@@ -824,9 +882,10 @@ def acquire_source_path(input_arg: str) -> tuple[Path, bool]:
             print()
             return completed[0], True
 
-        downloaded_path: Path = download_remote_file_with_fallback(
-            input_arg, download_folder
-        )
+        with timed_stage("Download", stage_times):
+            downloaded_path: Path = download_remote_file_with_fallback(
+                input_arg, download_folder
+            )
         print_saved(downloaded_path)
         print()
         return downloaded_path, True
@@ -847,30 +906,42 @@ def acquire_source_path(input_arg: str) -> tuple[Path, bool]:
     return local_path, False
 
 
-def process_single_media_file(source_path: Path, working_folder: Path) -> Path:
+def process_single_media_file(
+    source_path: Path, working_folder: Path, stage_times: list[tuple[str, float]]
+) -> Path:
     """Remux one media file and return the output file to upload."""
-    streams, audio_streams = probe_and_select_audio_streams(source_path)
-    output_folder: Path = create_output_folder(working_folder, source_path.stem)
-    output_file: Path = output_folder / generate_ddp_remuxed_filename(
-        source_path, audio_streams
-    )
     print_heading("Remuxing")
     print_found_item(source_path, blank_after=False)
-    remux_single_media_file(source_path, output_file, streams=streams)
+    with timed_stage(f"Remux {source_path.name}", stage_times):
+        streams, audio_streams = probe_and_select_audio_streams(source_path)
+        output_folder: Path = create_output_folder(working_folder, source_path.stem)
+        output_file: Path = output_folder / generate_ddp_remuxed_filename(
+            source_path, audio_streams
+        )
+        remux_single_media_file(source_path, output_file, streams=streams)
     print_saved(output_file)
     print()
     return output_file
 
 
-def process_media_archive(archive_path: Path, working_folder: Path) -> Path:
+def process_media_archive(
+    archive_path: Path, working_folder: Path, stage_times: list[tuple[str, float]]
+) -> Path:
     """Extract an archive, remux each media file, and return the repacked TAR."""
-    extracted_folder: Path = safely_extract_media_archive(archive_path, working_folder)
+    with timed_stage("Extract", stage_times):
+        extracted_folder: Path = safely_extract_media_archive(
+            archive_path, working_folder
+        )
     output_folder: Path = create_output_folder(working_folder, extracted_folder.name)
 
+    # Skip macOS AppleDouble ("._foo.mkv") and other dotfiles; they match the
+    # media extension but are metadata, not media.
     media_files_list: list[Path] = sorted(
         path
         for path in extracted_folder.rglob("*")
-        if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
+        if path.is_file()
+        and not path.name.startswith(".")
+        and path.suffix.lower() in MEDIA_EXTENSIONS
     )
     if not media_files_list:
         exit_with_error("No media files were found in the archive.")
@@ -881,13 +952,14 @@ def process_media_archive(archive_path: Path, working_folder: Path) -> Path:
     # One unreadable file aborts the whole run on purpose: a partial archive
     # must never be uploaded.
     for position, file_path in enumerate(media_files_list, 1):
-        file_streams, file_audio = probe_and_select_audio_streams(file_path)
-        relative_path: Path = file_path.relative_to(extracted_folder).with_name(
-            generate_ddp_remuxed_filename(file_path, file_audio)
-        )
-        output_path: Path = output_folder / relative_path
         print_batch_item(position, total_media_files, file_path)
-        remux_single_media_file(file_path, output_path, streams=file_streams)
+        with timed_stage(f"Remux {file_path.name}", stage_times):
+            file_streams, file_audio = probe_and_select_audio_streams(file_path)
+            relative_path: Path = file_path.relative_to(extracted_folder).with_name(
+                generate_ddp_remuxed_filename(file_path, file_audio)
+            )
+            output_path: Path = output_folder / relative_path
+            remux_single_media_file(file_path, output_path, streams=file_streams)
         print_saved(output_path)
         print()
 
@@ -895,7 +967,8 @@ def process_media_archive(archive_path: Path, working_folder: Path) -> Path:
     # the loose outputs are dead weight once the TAR exists; removing each
     # keeps peak disk usage at roughly two copies of the media.
     shutil.rmtree(extracted_folder)
-    archive: Path = create_tar_archive_from_folder(output_folder)
+    with timed_stage("Archive", stage_times):
+        archive: Path = create_tar_archive_from_folder(output_folder)
     shutil.rmtree(output_folder)
     return archive
 
@@ -911,7 +984,12 @@ def main() -> None:
     )
     args: argparse.Namespace = parser.parse_args()
 
+    # Fail fast on missing tools before a potentially large download starts.
+    for binary_name in ("ffmpeg", "ffprobe", "curl"):
+        validate_required_binary_in_path(binary_name)
+
     started: float = time.monotonic()
+    stage_times: list[tuple[str, float]] = []
     print(
         f"\n{ANSI_BOLD}remuxddp v{VERSION}{ANSI_RESET}: "
         "Remux and upload a media file or collection"
@@ -930,25 +1008,30 @@ def main() -> None:
             working_folder: Path = Path(temporary_folder)
             print(f"\nWorking folder: {working_folder}")
 
-            source_path, was_downloaded = acquire_source_path(input_arg)
+            source_path, was_downloaded = acquire_source_path(input_arg, stage_times)
             is_archive: bool = source_path.name.lower().endswith(_ARCHIVE_EXTENSIONS)
 
             if is_archive:
-                upload_target: Path = process_media_archive(source_path, working_folder)
+                upload_target: Path = process_media_archive(
+                    source_path, working_folder, stage_times
+                )
             else:
                 upload_target = process_single_media_file(
-                    source_path, working_folder
+                    source_path, working_folder, stage_times
                 )
 
-            download_page: str = upload_media_file_to_bzzhr(upload_target)
+            with timed_stage("Upload", stage_times):
+                download_page: str = upload_media_file_to_bzzhr(upload_target)
             print(f"{ANSI_GREEN}Download page:{ANSI_RESET} {download_page}")
-            print_elapsed(time.monotonic() - started)
+            print_stage_times(stage_times, time.monotonic() - started)
 
             if was_downloaded:
                 remove_partial_download(source_path)
     except KeyboardInterrupt:
         sys.stderr.write(
-            f"{ANSI_YELLOW}Canceled. Incomplete files were removed.{ANSI_RESET}\n"
+            f"{ANSI_YELLOW}Canceled. Partial outputs were removed; unfinished "
+            "downloads are kept and resume on the next run."
+            f"{ANSI_RESET}\n"
         )
         sys.exit(130)
     except OSError as error:
