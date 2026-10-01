@@ -78,14 +78,9 @@ ANSI_RESET: Final[str] = "\033[0m"
 # ----------------------------------------------------------------------
 
 
-def print_error(message: str) -> None:
-    """Print a formatted error message to standard error."""
-    sys.stderr.write(f"{ANSI_RED}Error:{ANSI_RESET} {message}\n")
-
-
 def exit_with_error(message: str, exit_code: int = 1) -> NoReturn:
-    """Print an error message and terminate the script."""
-    print_error(message)
+    """Print a formatted error message to standard error and terminate."""
+    sys.stderr.write(f"{ANSI_RED}Error:{ANSI_RESET} {message}\n")
     sys.exit(exit_code)
 
 
@@ -266,14 +261,10 @@ def build_gpac_command(
 
         if needs_audio_transcode:
             # ccp (Codec Check Passthrough) copies compatible formats (AAC, AC-3,
-            # E-AC-3, MP3, FLAC) while transcoding incompatible formats (DTS, TrueHD,
-            # Opus) to ALAC.
-            passthrough_codecs_list: list[str] = sorted(
-                codec
-                for codec in COMPATIBLE_AUDIO_CODECS
-                if codec != fallback_audio_codec
-            )
-            passthrough_codecs_string: str = ",".join(passthrough_codecs_list)
+            # E-AC-3, FLAC, MP3, ALAC) while transcoding incompatible formats
+            # (DTS, TrueHD, Opus) to ALAC, so already-compatible tracks are
+            # never wastefully re-encoded alac -> alac.
+            passthrough_codecs_string: str = ",".join(sorted(COMPATIBLE_AUDIO_CODECS))
             command.append(f"c={fallback_audio_codec}:ccp={passthrough_codecs_string}")
 
     # 3. Output MP4 Multiplexer Configuration (mp4mx)

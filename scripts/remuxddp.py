@@ -5,7 +5,7 @@ ZIP and TAR archives, remuxes audio streams to Dolby Digital Plus, repackages
 archives, and uploads the output to bzzhr.co using curl.
 
 Pipeline Workflow:
-    - Download: Accelerated transfer via aria2c (fallback to curl)
+    - Download: Accelerated, resumable transfer via aria2c (fallback to curl)
     - Archive Extraction: Unpacks ZIP (.zip) and TAR (.tar, .tar.gz, .tar.bz2, .tar.xz, .tgz)
     - Audio Transcoding: Converts FLAC, DTS, TrueHD, MLP, ALAC, AAC, Opus, Vorbis, and PCM
     - Language Filtering: Retains specified audio streams (English and Japanese by default)
@@ -25,6 +25,7 @@ Audio Encoding Specifications:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shlex
@@ -47,6 +48,10 @@ from typing import Final, NoReturn, TypedDict
 VERSION: Final[int] = 1
 
 DOWNLOADS_BASE_DIR: Final[Path] = Path.home() / "Downloads"
+
+# Stable folder for in-progress downloads; unlike the temp dir it survives a
+# failed run, so aria2c can resume an interrupted download on the next run.
+PARTIAL_DOWNLOADS_DIR: Final[Path] = DOWNLOADS_BASE_DIR / "remuxddp-partial"
 
 # Languages to retain (empty set retains all audio streams).
 # Note: If none of the selected languages are found in the media file,
@@ -213,18 +218,6 @@ ANSI_RED: Final[str] = "\033[31m"
 ANSI_RESET: Final[str] = "\033[0m"
 
 
-def print_script_intro(name: str, description: str, detail: str | None = None) -> None:
-    """Print the standard script header."""
-    print(f"\n{ANSI_BOLD}{name} v{VERSION}{ANSI_RESET}: {description}")
-    if detail:
-        print(detail)
-
-
-def print_working_folder(path: Path) -> None:
-    """Print active working temporary folder."""
-    print(f"\nWorking folder: {path}")
-
-
 def print_heading(title: str) -> None:
     """Print step heading."""
     print(f"{ANSI_BOLD}{title}{ANSI_RESET}")
@@ -253,11 +246,6 @@ def print_saved(path: Path) -> None:
     print(f"{ANSI_GREEN}Saved {path}{ANSI_RESET}")
 
 
-def print_uploaded(link: str) -> None:
-    """Print uploaded download link."""
-    print(f"{ANSI_GREEN}Download page:{ANSI_RESET} {link}")
-
-
 def print_elapsed(seconds: float) -> None:
     """Print the elapsed duration in a human-readable format."""
     rounded = max(0, round(seconds))
@@ -272,21 +260,9 @@ def print_elapsed(seconds: float) -> None:
     print(f"{ANSI_DIM}Completed in {' '.join(parts)}{ANSI_RESET}")
 
 
-def print_error(message: str) -> None:
-    """Print formatted error to stderr."""
-    sys.stderr.write(f"{ANSI_RED}Error:{ANSI_RESET} {message}\n")
-
-
-def print_canceled() -> None:
-    """Print a cancellation notice."""
-    sys.stderr.write(
-        f"{ANSI_YELLOW}Canceled. Incomplete files were removed.{ANSI_RESET}\n"
-    )
-
-
 def exit_with_error(message: str, code: int = 1) -> NoReturn:
     """Print an error message and exit."""
-    print_error(message)
+    sys.stderr.write(f"{ANSI_RED}Error:{ANSI_RESET} {message}\n")
     sys.exit(code)
 
 
@@ -712,6 +688,9 @@ def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Pa
         command = [
             aria2c,
             "--continue=true",
+            # Restart from scratch when the target exists without its .aria2
+            # control file (a finished download from an earlier failed run).
+            "--allow-overwrite=true",
             "--content-disposition=true",
             "--max-connection-per-server=16",
             "--split=16",
@@ -804,17 +783,53 @@ def create_output_folder(working_folder: Path, base_name: str) -> Path:
     return output_folder
 
 
-def acquire_source_path(input_arg: str, working_folder: Path) -> Path:
-    """Resolve the input argument to a local source path, downloading if needed."""
+def partial_download_folder_for_url(url: str) -> Path:
+    """Return the stable per-URL folder used for resumable downloads."""
+    url_key: str = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+    return PARTIAL_DOWNLOADS_DIR / url_key
+
+
+def remove_partial_download(downloaded_path: Path) -> None:
+    """Delete an uploaded download, keeping the folder only if partials remain."""
+    downloaded_path.unlink(missing_ok=True)
+    downloaded_path.with_name(f"{downloaded_path.name}.aria2").unlink(missing_ok=True)
+    try:
+        downloaded_path.parent.rmdir()
+    except OSError:
+        pass
+
+
+def acquire_source_path(input_arg: str) -> tuple[Path, bool]:
+    """Resolve the input to a local path and whether it lives in the partial folder."""
     parsed: urllib.parse.ParseResult = urllib.parse.urlparse(input_arg)
 
     if parsed.scheme in {"http", "https"}:
+        # Downloads live in a stable per-URL folder (never the temp dir) so
+        # aria2c's --continue can resume an interrupted download when the same
+        # URL is re-run; the file is deleted only after a successful upload.
+        download_folder: Path = partial_download_folder_for_url(input_arg)
+        download_folder.mkdir(parents=True, exist_ok=True)
+
+        completed: list[Path] = [
+            path
+            for path in download_folder.iterdir()
+            if not path.name.endswith(".aria2")
+        ]
+        if len(completed) == 1 and not completed[0].with_name(
+            f"{completed[0].name}.aria2"
+        ).exists():
+            # Finished download from an earlier run that failed later; reuse it.
+            print_found_item(completed[0])
+            print_heading("Reusing previous download")
+            print()
+            return completed[0], True
+
         downloaded_path: Path = download_remote_file_with_fallback(
-            input_arg, working_folder
+            input_arg, download_folder
         )
         print_saved(downloaded_path)
         print()
-        return downloaded_path
+        return downloaded_path, True
 
     local_path: Path = Path(input_arg).expanduser()
     if not local_path.exists():
@@ -829,7 +844,7 @@ def acquire_source_path(input_arg: str, working_folder: Path) -> Path:
     print_found_item(local_path)
     print_heading("Using local input")
     print()
-    return local_path
+    return local_path, False
 
 
 def process_single_media_file(source_path: Path, working_folder: Path) -> Path:
@@ -876,7 +891,13 @@ def process_media_archive(archive_path: Path, working_folder: Path) -> Path:
         print_saved(output_path)
         print()
 
-    return create_tar_archive_from_folder(output_folder)
+    # The extracted originals are dead weight once every file is remuxed, and
+    # the loose outputs are dead weight once the TAR exists; removing each
+    # keeps peak disk usage at roughly two copies of the media.
+    shutil.rmtree(extracted_folder)
+    archive: Path = create_tar_archive_from_folder(output_folder)
+    shutil.rmtree(output_folder)
+    return archive
 
 
 def main() -> None:
@@ -891,10 +912,12 @@ def main() -> None:
     args: argparse.Namespace = parser.parse_args()
 
     started: float = time.monotonic()
-    print_script_intro(
-        "remuxddp",
-        "Remux and upload a media file or collection",
-        detail="Converts FLAC, DTS, TrueHD, MLP, ALAC, AAC, Opus, Vorbis, and PCM audio to E-AC-3.",
+    print(
+        f"\n{ANSI_BOLD}remuxddp v{VERSION}{ANSI_RESET}: "
+        "Remux and upload a media file or collection"
+    )
+    print(
+        "Converts FLAC, DTS, TrueHD, MLP, ALAC, AAC, Opus, Vorbis, and PCM audio to E-AC-3."
     )
 
     input_arg: str = args.source
@@ -905,9 +928,9 @@ def main() -> None:
             prefix=TEMP_DIR_PREFIX, dir=DOWNLOADS_BASE_DIR
         ) as temporary_folder:
             working_folder: Path = Path(temporary_folder)
-            print_working_folder(working_folder)
+            print(f"\nWorking folder: {working_folder}")
 
-            source_path: Path = acquire_source_path(input_arg, working_folder)
+            source_path, was_downloaded = acquire_source_path(input_arg)
             is_archive: bool = source_path.name.lower().endswith(_ARCHIVE_EXTENSIONS)
 
             if is_archive:
@@ -918,10 +941,15 @@ def main() -> None:
                 )
 
             download_page: str = upload_media_file_to_bzzhr(upload_target)
-            print_uploaded(download_page)
+            print(f"{ANSI_GREEN}Download page:{ANSI_RESET} {download_page}")
             print_elapsed(time.monotonic() - started)
+
+            if was_downloaded:
+                remove_partial_download(source_path)
     except KeyboardInterrupt:
-        print_canceled()
+        sys.stderr.write(
+            f"{ANSI_YELLOW}Canceled. Incomplete files were removed.{ANSI_RESET}\n"
+        )
         sys.exit(130)
     except OSError as error:
         exit_with_error(f"Filesystem error: {error}")
