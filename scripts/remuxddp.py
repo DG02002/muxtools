@@ -2,15 +2,15 @@
 
 Downloads remote files or archives using aria2c (with curl fallback), extracts
 ZIP and TAR archives, remuxes audio streams to Dolby Digital Plus, repackages
-archives, and uploads the output to Gofile using curl.
+archives, and uploads the output to bzzhr.co using curl.
 
 Pipeline Workflow:
     - Download: Accelerated transfer via aria2c (fallback to curl)
     - Archive Extraction: Unpacks ZIP (.zip) and TAR (.tar, .tar.gz, .tar.bz2, .tar.xz, .tgz)
-    - Audio Transcoding: Converts lossless/surround codecs (FLAC, DTS, TrueHD, ALAC, AAC)
+    - Audio Transcoding: Converts FLAC, DTS, TrueHD, MLP, ALAC, AAC, Opus, Vorbis, and PCM
     - Language Filtering: Retains specified audio streams (English and Japanese by default)
     - Packaging: Repackages batch media into TAR archives
-    - Upload: Posts files or archives to Gofile via curl
+    - Upload: Uploads files or archives to bzzhr.co via curl
 
 Audio Encoding Specifications:
     - Codec: E-AC-3 (Dolby Digital Plus)
@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shlex
 import shutil
@@ -58,25 +57,88 @@ CONVERT_AUDIO_CODECS: Final[frozenset[str]] = frozenset({
     "flac",
     "dts",
     "truehd",
+    "mlp",
     "alac",
     "aac",
+    "opus",
+    "vorbis",
+    "pcm_s16le",
+    "pcm_s24le",
+    "pcm_s32le",
+    "pcm_f32le",
+    "pcm_s16be",
+    "pcm_s24be",
+    "pcm_bluray",
+    "pcm_dvd",
 })
 
 MEDIA_EXTENSIONS: Final[frozenset[str]] = frozenset({".mkv", ".mp4", ".webm"})
 
-CODEC_TOKENS: Final[dict[str, str]] = {
-    "flac": "FLAC",
-    "dts": "DTS",
-    "truehd": "TrueHD",
-    "alac": "ALAC",
-    "aac": "AAC",
-}
+# Audio codec tokens in release filenames to replace with DDP when transcoding:
+# - TrueHD, TrueHD Atmos
+# - DTS, DTS-HD MA, DTS-HD HRA, DTS-HD, DTS-MA, DTS-ES, DTS:X, DTS-X
+# - AAC, AAC-LC, HE-AAC
+# - FLAC, ALAC, OPUS, Vorbis, LPCM, PCM, MLP
+_CONVERTIBLE_AUDIO_TOKEN_PATTERNS: Final[tuple[str, ...]] = (
+    r"TrueHD(?:[._ -]?Atmos)?",
+    r"DTS(?:[._ -]?HD(?:[._ -]?(?:MA|HRA|HR))?|[._ -]?(?:MA|ES|X)|:X)?",
+    r"(?:HE[._ -]?)?AAC(?:[._ -]?LC)?",
+    r"FLAC",
+    r"ALAC",
+    r"OPUS",
+    r"Vorbis",
+    r"L?PCM",
+    r"MLP",
+)
+_JOINED_AUDIO_TOKEN_PATTERNS: Final[str] = "|".join(_CONVERTIBLE_AUDIO_TOKEN_PATTERNS)
 
-VIDEO_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(
+AUDIO_CODEC_REPLACE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    pattern=rf"(?i)(?<![A-Za-z0-9])(?:{_JOINED_AUDIO_TOKEN_PATTERNS})(?=(?:[1257]\.[01]\b|[^A-Za-z0-9]|$))"
+)
+
+# Strips trailing "Atmos" when it appears after the channel layout (e.g., TrueHD.5.1.Atmos -> DDP.5.1)
+POST_CHANNEL_ATMOS_PATTERN: Final[re.Pattern[str]] = re.compile(
+    pattern=r"(?i)(\bDDP(?:[._ -]?[1257]\.[01])?)[._ -]+Atmos(?![A-Za-z0-9])"
+)
+
+# Matches existing Dolby Digital Plus tokens (DDP, DDPA, DDP Atmos, EAC3, E-AC-3, DD+)
+EXISTING_DDP_PATTERN: Final[re.Pattern[str]] = re.compile(
+    pattern=r"(?i)(?<![A-Za-z0-9])(?:DDPA?(?:[._ -]?Atmos)?|E-?AC-?3(?:[._ -]?Atmos)?|DD\+)(?=(?:[1257]\.[01]\b|[^A-Za-z0-9]|$))"
+)
+
+# Marks the end of the show/movie title via Season/Episode (S01E01, S01, E01) or release year
+EPISODE_OR_YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(
     pattern=(
-        r"(?i)(?<![A-Za-z0-9])"
-        r"(?:x26[45]|h[._-]?26[45]|hevc|av1)"
-        r"(?![A-Za-z0-9])"
+        r"(?<![A-Za-z0-9])(?:"
+        r"(?i:S\d{1,4}(?:E\d{1,4})?(?:[._ -]?v\d+)?|E\d{1,4}(?:[._ -]?v\d+)?)|"
+        r"(?:19|20)\d{2}"
+        r")(?![A-Za-z0-9])"
+    )
+)
+
+# Pre-audio release metadata tokens (Common, Resolution/Remaster, Source, Streaming Service, MULTi)
+PRE_AUDIO_TECH_PATTERN: Final[re.Pattern[str]] = re.compile(
+    pattern=(
+        r"(?<![A-Za-z0-9])(?:"
+        r"(?i:PROPER|REPACK|RERIP)|"
+        r"(?i:2160p|1080p|720p|576p|480p|4K|UHD|DS4K|RM4K)|"
+        r"(?i:Blu-?Ray|BDRemux|REMUX|BDRip|BRRip|WEB-?DL|WEBDL|WEBRip|WEB)|"
+        r"(?i:AMZN|APTV|DNSP|DSNP|HULU|PMTP)|"
+        r"(?:HBO|MAX|HMAX|HS|IT|JC|MA|NF)|"
+        r"(?i:MULTi|Dual[._ -]?Audio)"
+        r")(?![A-Za-z0-9])"
+    )
+)
+
+# Post-audio video codec, HDR/Dolby Vision, and bitrate mode tokens
+VIDEO_AND_HDR_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(
+    pattern=(
+        r"(?<![A-Za-z0-9])(?:"
+        r"(?i:x26[45]|h[._-]?26[45]|hevc|avc|av1)|"
+        r"(?i:HDR10(?:P|PLUS|\+)|HDRP10\+|HDR10|HDR|HLG|DoVi|DV[._ -]?HDR)|"
+        r"(?:DV|CBR)|"
+        r"(?i:10[._ -]?bit|Hi10p?)"
+        r")(?![A-Za-z0-9])"
     )
 )
 
@@ -124,17 +186,17 @@ class FFProbeResult(TypedDict, total=False):
     streams: list[Stream]
 
 
-class GoFileData(TypedDict, total=False):
-    """Nested payload within Gofile upload response."""
+class BzzhrData(TypedDict, total=False):
+    """Nested payload within bzzhr.co upload response."""
 
-    downloadPage: str
+    id: str
 
 
-class GoFileResponse(TypedDict, total=False):
-    """Gofile API JSON response schema."""
+class BzzhrResponse(TypedDict, total=False):
+    """bzzhr.co API JSON response schema."""
 
-    status: str
-    data: GoFileData
+    code: int
+    data: BzzhrData
 
 
 # --------------------------------------------------
@@ -302,6 +364,20 @@ def probe_media_streams_with_ffprobe(media_path: Path) -> list[Stream]:
 # --------------------------------------------------
 
 
+def select_audio_streams(streams: Sequence[Stream]) -> list[Stream]:
+    """Select audio streams matching KEEP_LANGUAGES, falling back to all audio streams."""
+    all_audio_streams: list[Stream] = [
+        stream for stream in streams if stream.get("codec_type") == "audio"
+    ]
+    selected_audio_streams: list[Stream] = [
+        stream
+        for stream in all_audio_streams
+        if not KEEP_LANGUAGES
+        or stream.get("tags", {}).get("language", "").lower() in KEEP_LANGUAGES
+    ]
+    return selected_audio_streams or all_audio_streams
+
+
 def determine_eac3_bit_rate_by_channel_count(channels: int) -> str:
     """Select bit rate for E-AC-3 based on audio channels."""
     if channels > 6:
@@ -318,7 +394,7 @@ def determine_eac3_bit_rate_by_channel_count(channels: int) -> str:
 def generate_ddp_remuxed_filename(
     source_path: Path, audio_streams: Sequence[Stream]
 ) -> str:
-    """Generate output filename replacing audio tags (such as FLAC to DDP5.1)."""
+    """Generate output filename replacing or inserting DDP audio tags."""
     converted: set[str] = {
         stream.get("codec_name", "").lower()
         for stream in audio_streams
@@ -326,18 +402,20 @@ def generate_ddp_remuxed_filename(
     }
 
     stem: str = source_path.stem
+    if not converted:
+        return f"{stem}.mkv"
+
     original_stem: str = stem
 
-    for codec in sorted(converted, key=len, reverse=True):
-        token: str = CODEC_TOKENS[codec]
-        stem = re.sub(
-            pattern=rf"(?i)(?<![A-Za-z]){re.escape(token)}(?![A-Za-z])",
-            repl="DDP",
-            string=stem,
-        )
+    # 1. Replace existing convertible audio codec tokens in-place with DDP
+    stem = AUDIO_CODEC_REPLACE_PATTERN.sub("DDP", stem)
+    stem = POST_CHANNEL_ATMOS_PATTERN.sub(r"\1", stem)
+    stem = re.sub(r"(?i)\bDDP(?:[._ -]+DDP)+\b", "DDP", stem)
 
-    has_ddp: bool = bool(re.search(r"(?i)(?<![A-Za-z])DDP(?![A-Za-z])", stem))
-    if converted and stem == original_stem and not has_ddp:
+    # 2. If no audio codec token was present in the filename, insert DDP<layout>
+    #    at the appropriate release-metadata position.
+    has_ddp: bool = bool(EXISTING_DDP_PATTERN.search(stem))
+    if stem == original_stem and not has_ddp:
         layouts: list[str] = []
         for stream in audio_streams:
             codec_name: str = stream.get("codec_name", "").lower()
@@ -353,14 +431,55 @@ def generate_ddp_remuxed_filename(
                     layouts.append(tag)
 
         tag_str: str = ".".join(layouts or ["DDP"])
-        match: re.Match[str] | None = VIDEO_TOKEN_PATTERN.search(stem)
-        if match:
-            sep: str = "" if match.start() == 0 else "."
-            prefix: str = stem[: match.start()].rstrip(" ._-")
-            suffix: str = stem[match.start() :]
-            stem = f"{prefix}{sep}{tag_str}.{suffix}"
+
+        episode_or_year_matches: list[re.Match[str]] = [
+            match
+            for match in EPISODE_OR_YEAR_PATTERN.finditer(stem)
+            if match.start() > 0
+        ]
+        title_end: int = (
+            episode_or_year_matches[0].end() if episode_or_year_matches else 1
+        )
+
+        pre_matches: list[re.Match[str]] = list(
+            PRE_AUDIO_TECH_PATTERN.finditer(stem, pos=title_end)
+        )
+        min_pos: int = pre_matches[-1].end() if pre_matches else title_end
+        video_match: re.Match[str] | None = VIDEO_AND_HDR_TOKEN_PATTERN.search(
+            stem, pos=min_pos
+        )
+
+        if video_match:
+            insert_pos: int = video_match.start()
+            if insert_pos > 0 and stem[insert_pos - 1] in "[(":
+                insert_pos -= 1
+            sep: str = " " if insert_pos > 0 and stem[insert_pos - 1] == " " else "."
+            prefix: str = stem[:insert_pos].rstrip(" ._-")
+            suffix: str = stem[insert_pos:]
+            stem = (
+                f"{prefix}{sep}{tag_str}{sep}{suffix}"
+                if prefix
+                else f"{tag_str}{sep}{suffix}"
+            )
+        elif pre_matches:
+            insert_pos = pre_matches[-1].end()
+            while insert_pos < len(stem) and stem[insert_pos] in "])":
+                insert_pos += 1
+            sep = " " if (" " in stem and "." not in stem) else "."
+            prefix = stem[:insert_pos]
+            suffix = stem[insert_pos:]
+            stem = f"{prefix}{sep}{tag_str}{suffix}"
         else:
-            stem = f"{stem}.{tag_str}"
+            group_match: re.Match[str] | None = re.search(
+                r"(-[A-Za-z0-9]+)$", stem
+            )
+            if group_match and group_match.start() >= title_end:
+                stem = (
+                    f"{stem[:group_match.start()]}.{tag_str}{group_match.group(1)}"
+                )
+            else:
+                sep = " " if (" " in stem and "." not in stem) else "."
+                stem = f"{stem}{sep}{tag_str}"
 
     return f"{stem}.mkv"
 
@@ -387,17 +506,7 @@ def construct_ffmpeg_ddp_remux_command(
         "0:v?",
     ]
 
-    all_audio_streams: list[Stream] = [
-        stream for stream in streams if stream.get("codec_type") == "audio"
-    ]
-    selected_audio_streams: list[Stream] = [
-        stream
-        for stream in all_audio_streams
-        if not KEEP_LANGUAGES
-        or stream.get("tags", {}).get("language", "").lower() in KEEP_LANGUAGES
-    ]
-    if not selected_audio_streams:
-        selected_audio_streams = all_audio_streams
+    selected_audio_streams: list[Stream] = select_audio_streams(streams)
 
     for stream in selected_audio_streams:
         stream_index: int = stream.get("index", 0)
@@ -408,11 +517,19 @@ def construct_ffmpeg_ddp_remux_command(
         "0:s?",
         "-map",
         "0:d?",
+        "-map",
+        "0:t?",
         "-map_metadata",
         "0",
         "-map_chapters",
         "0",
-        "-c",
+        "-c:v",
+        "copy",
+        "-c:s",
+        "copy",
+        "-c:d",
+        "copy",
+        "-c:t",
         "copy",
     ])
 
@@ -440,26 +557,43 @@ def construct_ffmpeg_ddp_remux_command(
                     f"-metadata:s:a:{output_index}",
                     f"language={language}",
                 ])
+        else:
+            command.extend([
+                f"-c:a:{output_index}",
+                "copy",
+            ])
 
     command.append(str(output_path))
     return command
 
 
-def remux_single_media_file(source_path: Path, output_path: Path) -> None:
+def remux_single_media_file(
+    source_path: Path,
+    output_path: Path,
+    streams: Sequence[Stream] | None = None,
+) -> None:
     """Remux a single media file to MKV with E-AC-3 audio."""
-    streams: list[Stream] = probe_media_streams_with_ffprobe(source_path)
+    resolved_streams: Sequence[Stream] = (
+        streams
+        if streams is not None
+        else probe_media_streams_with_ffprobe(source_path)
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     command: list[str] = construct_ffmpeg_ddp_remux_command(
         source_path=source_path,
         output_path=output_path,
-        streams=streams,
+        streams=resolved_streams,
     )
     print(shlex.join(command))
 
     result: subprocess.CompletedProcess[bytes] = subprocess.run(
         args=command, check=False
     )
-    if result.returncode != 0:
+    if (
+        result.returncode != 0
+        or not output_path.is_file()
+        or output_path.stat().st_size == 0
+    ):
         exit_with_error(
             f"Unable to remux '{source_path.name}' with FFmpeg (exit code {result.returncode})."
         )
@@ -582,51 +716,49 @@ def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Pa
     return min(new_files)
 
 
-def upload_media_file_to_gofile(file_to_upload: Path) -> str:
-    """Upload file to Gofile and return download link."""
+def upload_media_file_to_bzzhr(file_to_upload: Path) -> str:
+    """Upload file to bzzhr.co and return download link."""
     curl: str = validate_required_binary_in_path("curl")
-    token: str | None = os.environ.get("GOFILE_TOKEN")
+    encoded_name: str = urllib.parse.quote(file_to_upload.name)
+    upload_url: str = f"https://w.bzzhr.co/{encoded_name}"
 
     print_heading("Uploading")
     command: list[str] = [
         curl,
-        "--fail-with-body",
-        "--location",
-        "--request",
-        "POST",
-        "--form",
-        f"file=@{file_to_upload}",
+        "-o",
+        "-",
+        "-T",
+        str(file_to_upload),
+        upload_url,
     ]
-    if token:
-        command.extend(["--header", f"Authorization: Bearer {token}"])
-    command.append("https://upload.gofile.io/uploadfile")
 
     print(shlex.join(command))
+    # Capture stdout for the JSON response while leaving stderr attached to the
+    # terminal so curl renders its live transfer stats (speed, ETA, bytes).
     result: subprocess.CompletedProcess[str] = subprocess.run(
         args=command,
-        capture_output=True,
+        stdout=subprocess.PIPE,
         text=True,
         check=False,
     )
     if result.returncode != 0:
-        error_message: str = result.stderr.strip()
-        exit_with_error(f"Gofile upload failed:\n{error_message}")
+        exit_with_error(f"bzzhr.co upload failed (exit code {result.returncode}).")
 
     try:
-        response: GoFileResponse = json.loads(result.stdout)
-        response_data: GoFileData | None = response.get("data")
-        link: str | None = (
-            response_data.get("downloadPage")
+        response: BzzhrResponse = json.loads(result.stdout)
+        response_data: BzzhrData | None = response.get("data")
+        file_id: str | None = (
+            response_data.get("id")
             if isinstance(response_data, dict)
             else None
         )
-        if not link:
+        if not file_id:
             exit_with_error(
-                "The Gofile upload response didn't include a download page link."
+                "The bzzhr.co upload response didn't include a file ID."
             )
-        return str(link)
+        return f"https://bzzhr.co/{file_id}"
     except json.JSONDecodeError:
-        exit_with_error("Unable to parse Gofile upload response.")
+        exit_with_error("Unable to parse bzzhr.co upload response.")
         return ""
 
 
@@ -650,7 +782,7 @@ def main() -> None:
     print_script_intro(
         "remuxddp",
         "Remux and upload a media file or collection",
-        detail="Converts FLAC, DTS, TrueHD, ALAC, and AAC audio to E-AC-3.",
+        detail="Converts FLAC, DTS, TrueHD, MLP, ALAC, AAC, Opus, Vorbis, and PCM audio to E-AC-3.",
     )
 
     input_arg: str = args.source
@@ -690,19 +822,21 @@ def main() -> None:
             upload_target: Path
             if not is_archive:
                 streams: list[Stream] = probe_media_streams_with_ffprobe(source_path)
-                audio_streams: list[Stream] = [
-                    stream for stream in streams if stream.get("codec_type") == "audio"
-                ]
+                audio_streams: list[Stream] = select_audio_streams(streams)
                 if not audio_streams:
                     exit_with_error(
                         f"No audio streams were found in '{source_path.name}'."
                     )
-                output_file: Path = working_folder / generate_ddp_remuxed_filename(
+                output_folder: Path = (
+                    working_folder / f"{source_path.stem}{OUTPUT_FOLDER_SUFFIX}"
+                )
+                output_folder.mkdir(parents=True, exist_ok=True)
+                output_file: Path = output_folder / generate_ddp_remuxed_filename(
                     source_path, audio_streams
                 )
                 print_heading("Remuxing")
                 print_found_item(source_path, blank_after=False)
-                remux_single_media_file(source_path, output_file)
+                remux_single_media_file(source_path, output_file, streams=streams)
                 print_saved(output_file)
                 print()
                 upload_target = output_file
@@ -710,7 +844,7 @@ def main() -> None:
                 extracted_folder: Path = safely_extract_media_archive(
                     source_path, working_folder
                 )
-                output_folder: Path = (
+                output_folder = (
                     working_folder / f"{extracted_folder.name}{OUTPUT_FOLDER_SUFFIX}"
                 )
                 output_folder.mkdir(parents=True, exist_ok=True)
@@ -730,24 +864,22 @@ def main() -> None:
                     file_streams: list[Stream] = probe_media_streams_with_ffprobe(
                         file_path
                     )
-                    file_audio: list[Stream] = [
-                        stream
-                        for stream in file_streams
-                        if stream.get("codec_type") == "audio"
-                    ]
+                    file_audio: list[Stream] = select_audio_streams(file_streams)
                     relative_path: Path = file_path.relative_to(
                         extracted_folder
                     ).with_name(generate_ddp_remuxed_filename(file_path, file_audio))
                     output_path: Path = output_folder / relative_path
                     print_batch_item(position, total_media_files, file_path)
-                    remux_single_media_file(file_path, output_path)
+                    remux_single_media_file(
+                        file_path, output_path, streams=file_streams
+                    )
                     print_saved(output_path)
                     print()
 
                 upload_target = create_tar_archive_from_folder(output_folder)
 
             # Upload
-            download_page: str = upload_media_file_to_gofile(upload_target)
+            download_page: str = upload_media_file_to_bzzhr(upload_target)
             print_uploaded(download_page)
             print_elapsed(time.monotonic() - started)
     except KeyboardInterrupt:
