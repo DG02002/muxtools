@@ -886,6 +886,10 @@ def download_file(url: str, destination_folder: Path) -> Path:
             # --fail rejects HTTP errors (exit code 22) and writes no response
             # body at all, so an error page never pollutes the resumable .part.
             "--fail",
+            # Retries transient failures (timeouts, HTTP 408/429/5xx) within
+            # this run; interrupted transfers exit 18 and resume on re-run.
+            "--retry",
+            "3",
             "--continue-at",
             "-",
             "-o",
