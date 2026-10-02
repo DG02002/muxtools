@@ -103,7 +103,12 @@ def format_duration(seconds: float) -> str:
 def print_stage_times(
     stage_times: Sequence[tuple[str, float]], total_seconds: float
 ) -> None:
-    """Print the end-of-run per-file time report table."""
+    """Print the end-of-run per-file time report table.
+
+    Args:
+        stage_times: (label, seconds) rows in run order.
+        total_seconds: Wall-clock total printed beneath the rows.
+    """
     durations: list[str] = [format_duration(seconds) for _, seconds in stage_times]
     total_text: str = format_duration(total_seconds)
     label_width: int = max([len(label) for label, _ in stage_times] + [len("Total")])
@@ -138,7 +143,18 @@ def find_required_tool(binary_name: str) -> str:
 
 
 def probe_media_streams(source_file_path: Path) -> list[dict[str, Any]]:
-    """Inspect stream metadata from a media file using ffprobe."""
+    """Inspect stream metadata from a media file using ffprobe.
+
+    Args:
+        source_file_path: Media file to inspect.
+
+    Returns:
+        The parsed stream list; empty when the file has no streams.
+
+    Raises:
+        SystemExit: When ffprobe fails, times out, or returns unparseable
+            JSON.
+    """
     ffprobe_executable: str = find_required_tool("ffprobe")
 
     probe_command: list[str] = [
@@ -186,7 +202,15 @@ def probe_media_streams(source_file_path: Path) -> list[dict[str, Any]]:
 
 
 def extract_frame_rate(video_stream: dict[str, Any]) -> str | None:
-    """Extract a valid rational frame rate string from video stream metadata."""
+    """Extract a valid rational frame rate string from video stream metadata.
+
+    Args:
+        video_stream: ffprobe video stream dictionary.
+
+    Returns:
+        The first usable rate of r_frame_rate / avg_frame_rate (for
+        example "24000/1001"), or None when neither is a valid rational.
+    """
     rate_key: str
     for rate_key in ("r_frame_rate", "avg_frame_rate"):
         rate_value: str = str(video_stream.get(rate_key, "")).strip()
@@ -212,7 +236,15 @@ def extract_dolby_vision_profile(video_stream: dict[str, Any]) -> int | None:
 def find_primary_video_stream(
     streams: Sequence[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """Locate the primary video stream, ignoring attached pictures / cover art."""
+    """Locate the primary video stream, ignoring attached pictures / cover art.
+
+    Args:
+        streams: ffprobe stream dictionaries of one media file.
+
+    Returns:
+        The first real video stream, or None when only attached pictures
+        or no video at all is present.
+    """
     stream: dict[str, Any]
     for stream in streams:
         if stream.get("codec_type") == "video" and not stream.get(
@@ -234,7 +266,23 @@ def build_gpac_command(
     video_stream: dict[str, Any],
     verbose: bool = False,
 ) -> list[str]:
-    """Construct the complete GPAC command for Apple QuickTime compatible MP4 muxing."""
+    """Construct the complete GPAC command for QuickTime-compatible MP4 muxing.
+
+    Pins the source FPS to avoid timing drift, reframes AVC/HEVC with
+    rfnalu, applies the Dolby Vision sample-entry rules, copies or
+    transcodes audio per the codec allow list, and configures the mp4mx
+    multiplexer for Apple playback.
+
+    Args:
+        source_file_path: Media file to read.
+        output_file_path: MP4 file for GPAC to write.
+        streams: Probed streams of the source, used for audio decisions.
+        video_stream: Primary video stream from find_primary_video_stream.
+        verbose: When True, drops the error-only GPAC log filter.
+
+    Returns:
+        The complete argv list for subprocess.run.
+    """
     gpac_executable: str = find_required_tool("gpac")
 
     command: list[str] = [gpac_executable]
@@ -315,7 +363,18 @@ def build_gpac_command(
 def remux_file(
     source_file_path: Path, output_file_path: Path, verbose: bool = False
 ) -> None:
-    """Remux a single media file to MP4 using an atomic temporary directory write."""
+    """Remux a single media file to MP4 with an atomic temporary write.
+
+    Args:
+        source_file_path: Media file to read.
+        output_file_path: MP4 file to write; it appears atomically via a
+            rename from an adjacent temporary directory.
+        verbose: Passed through to build_gpac_command.
+
+    Raises:
+        SystemExit: When the input is missing, no video stream exists,
+            probing fails, or GPAC fails or writes no output.
+    """
     if not source_file_path.is_file():
         exit_with_error(f"Unable to find '{source_file_path}'.")
 
@@ -369,7 +428,15 @@ def remux_file(
 
 
 def mp4_output_path_for(source_path: Path) -> Path:
-    """Generate output path with .mp4 or .quicktime.mp4 extension."""
+    """Generate the output path with .mp4 or .quicktime.mp4 extension.
+
+    Args:
+        source_path: Source path; may be relative to a folder job.
+
+    Returns:
+        The source renamed to .quicktime.mp4 for .mp4 inputs and to .mp4
+        for every other extension.
+    """
     target_suffix: str = (
         ".quicktime.mp4" if source_path.suffix.lower() == ".mp4" else ".mp4"
     )
@@ -394,7 +461,18 @@ def resolve_file_job(
     output_destination: Path | None,
     has_multiple_inputs: bool,
 ) -> tuple[Path, Path]:
-    """Resolve destination path for a single input file."""
+    """Resolve the destination path for a single input file.
+
+    Args:
+        source_file: Input file.
+        output_destination: Explicit -o destination, or None.
+        has_multiple_inputs: Whether several inputs share the destination.
+
+    Returns:
+        A (source, target) job pair: next to the source when no
+        destination is given, under the destination by renamed filename
+        when batching, or exactly the destination for one explicit file.
+    """
     if output_destination is None:
         return source_file, mp4_output_path_for(source_file)
 
@@ -410,7 +488,21 @@ def resolve_folder_jobs(
     output_destination: Path | None,
     has_multiple_inputs: bool,
 ) -> list[tuple[Path, Path]]:
-    """Resolve destination paths for all media files inside a directory."""
+    """Resolve destination paths for all media files inside a directory.
+
+    Args:
+        source_folder: Input folder to walk recursively.
+        output_destination: Explicit -o destination, or None.
+        has_multiple_inputs: Whether several inputs share the destination.
+
+    Returns:
+        (source, target) job pairs that mirror the folder structure under
+        <folder>.quickmp4 or the explicit destination.
+
+    Raises:
+        SystemExit: When the folder can't be found, holds no supported
+            media, or the destination would land inside the source folder.
+    """
     if not source_folder.is_dir():
         exit_with_error(f"Unable to find the folder '{source_folder}'.")
 
@@ -449,7 +541,19 @@ def resolve_folder_jobs(
 def plan_remux_jobs(
     sources: Sequence[Path], output_destination: Path | None
 ) -> list[tuple[Path, Path]]:
-    """Determine source-to-destination pairs for all requested files and folders."""
+    """Determine source-to-destination pairs for all requested files and folders.
+
+    Args:
+        sources: Command-line inputs (files or folders).
+        output_destination: Explicit -o destination, or None.
+
+    Returns:
+        (source, target) job pairs for every input.
+
+    Raises:
+        SystemExit: When an input can't be found or two inputs resolve to
+            the same output file.
+    """
     remux_jobs: list[tuple[Path, Path]] = []
     has_multiple_inputs: bool = len(sources) > 1
 

@@ -264,7 +264,12 @@ def format_duration(seconds: float) -> str:
 def print_stage_times(
     stage_times: Sequence[tuple[str, float]], total_seconds: float
 ) -> None:
-    """Print the end-of-run per-stage time report table."""
+    """Print the end-of-run per-stage time report table.
+
+    Args:
+        stage_times: (label, seconds) rows in run order.
+        total_seconds: Wall-clock total printed beneath the rows.
+    """
     durations: list[str] = [format_duration(seconds) for _, seconds in stage_times]
     total_text: str = format_duration(total_seconds)
     label_width: int = max([len(label) for label, _ in stage_times] + [len("Total")])
@@ -284,7 +289,16 @@ def print_stage_times(
 
 @contextmanager
 def timed_stage(label: str, stage_times: list[tuple[str, float]]) -> Iterator[None]:
-    """Time one pipeline stage for the end-of-run report."""
+    """Time one pipeline stage for the end-of-run report.
+
+    Args:
+        label: Row label shown in the time report.
+        stage_times: Shared list the (label, seconds) row is appended to
+            when the stage completes; a failed stage records nothing.
+
+    Yields:
+        None while the stage body runs.
+    """
     stage_started: float = time.monotonic()
     yield
     stage_times.append((label, time.monotonic() - stage_started))
@@ -335,7 +349,18 @@ def _archive_stem(path: Path) -> str:
 
 
 def probe_media_streams(media_path: Path) -> list[Stream]:
-    """Inspect stream metadata with ffprobe."""
+    """Inspect stream metadata with ffprobe.
+
+    Args:
+        media_path: Media file to inspect.
+
+    Returns:
+        The parsed stream list; empty when the file has no streams.
+
+    Raises:
+        SystemExit: When ffprobe is missing, fails, times out, or returns
+            unparseable JSON.
+    """
     ffprobe: str = find_required_tool("ffprobe")
     command: list[str] = [
         ffprobe,
@@ -380,7 +405,15 @@ def probe_media_streams(media_path: Path) -> list[Stream]:
 
 
 def select_audio_streams(streams: Sequence[Stream]) -> list[Stream]:
-    """Select audio streams matching KEEP_LANGUAGES, falling back to all audio streams."""
+    """Select audio streams matching KEEP_LANGUAGES, keeping all as fallback.
+
+    Args:
+        streams: ffprobe stream dictionaries from probe_media_streams.
+
+    Returns:
+        Audio streams whose language tag matches KEEP_LANGUAGES; every
+        audio stream when none matches (or KEEP_LANGUAGES is empty).
+    """
     all_audio_streams: list[Stream] = [
         stream for stream in streams if stream.get("codec_type") == "audio"
     ]
@@ -396,7 +429,18 @@ def select_audio_streams(streams: Sequence[Stream]) -> list[Stream]:
 def probe_and_select_audio_streams(
     media_path: Path,
 ) -> tuple[list[Stream], list[Stream]]:
-    """Probe a media file and select its audio streams, exiting when none exist."""
+    """Probe a media file and select the audio streams to remux.
+
+    Args:
+        media_path: Media file to inspect with ffprobe.
+
+    Returns:
+        A (streams, audio_streams) pair: every probed stream, and the
+        selected audio subset used for naming and remuxing.
+
+    Raises:
+        SystemExit: When the file has no audio streams at all.
+    """
     streams: list[Stream] = probe_media_streams(media_path)
     audio_streams: list[Stream] = select_audio_streams(streams)
     if not audio_streams:
@@ -424,7 +468,16 @@ def eac3_bit_rate_for(channels: int) -> str:
 
 
 def build_ddp_tag_string(audio_streams: Sequence[Stream], converted: set[str]) -> str:
-    """Build the DDP<layout> tags for the converted audio streams."""
+    """Build the DDP<layout> tags for the converted audio streams.
+
+    Args:
+        audio_streams: Selected audio streams of the source file.
+        converted: Codec names that will be transcoded to E-AC-3.
+
+    Returns:
+        Dot-joined tags such as "DDP5.1.DDP2.0", or "DDP" when no channel
+        layout is known.
+    """
     layouts: list[str] = []
     for stream in audio_streams:
         codec_name: str = stream.get("codec_name", "").lower()
@@ -440,7 +493,15 @@ def build_ddp_tag_string(audio_streams: Sequence[Stream], converted: set[str]) -
 
 
 def find_title_end(stem: str) -> int:
-    """Find where the title ends: after the first episode marker or release year."""
+    """Find where the title ends: after the first episode marker or year.
+
+    Args:
+        stem: Release filename without extension.
+
+    Returns:
+        The index just past the first season/episode marker or year, or 1
+        when neither is present.
+    """
     episode_or_year_matches: list[re.Match[str]] = [
         match
         for match in EPISODE_OR_YEAR_PATTERN.finditer(stem)
@@ -450,7 +511,20 @@ def find_title_end(stem: str) -> int:
 
 
 def insert_ddp_tag(stem: str, tag_str: str, title_end: int) -> str:
-    """Insert a DDP tag at the appropriate release-metadata position in a stem."""
+    """Insert a DDP tag at the appropriate release-metadata position.
+
+    Tries three positions in order: before the video/HDR token, after the
+    last pre-audio release token, and finally before a trailing release
+    group or at the end.
+
+    Args:
+        stem: Release filename without extension.
+        tag_str: The DDP tag(s) to insert, from build_ddp_tag_string.
+        title_end: The index where the title ends, from find_title_end.
+
+    Returns:
+        The stem with the tag inserted.
+    """
     pre_matches: list[re.Match[str]] = list(
         PRE_AUDIO_TECH_PATTERN.finditer(stem, pos=title_end)
     )
@@ -487,7 +561,20 @@ def insert_ddp_tag(stem: str, tag_str: str, title_end: int) -> str:
 def ddp_remuxed_filename_for(
     source_path: Path, audio_streams: Sequence[Stream]
 ) -> str:
-    """Generate output filename replacing or inserting DDP audio tags."""
+    """Generate the remuxed output filename with DDP audio tags.
+
+    Replaces convertible codec tokens (DTS-HD MA, TrueHD, FLAC, ...) with
+    DDP in place. When the filename carries no audio token at all, inserts
+    DDP<layout> at the release-metadata position instead. Files whose audio
+    is already E-AC-3 keep their original name.
+
+    Args:
+        source_path: Source media file; only its stem is used.
+        audio_streams: Selected audio streams of that file.
+
+    Returns:
+        The output filename, always ending in .mkv.
+    """
     converted: set[str] = {
         stream.get("codec_name", "").lower()
         for stream in audio_streams
@@ -525,7 +612,20 @@ def build_ffmpeg_remux_command(
     output_path: Path,
     streams: Sequence[Stream],
 ) -> list[str]:
-    """Build the FFmpeg command to copy video and transcode audio to E-AC-3."""
+    """Build the FFmpeg command to copy video and transcode audio to E-AC-3.
+
+    Maps video, the selected audio, subtitles, attachments, and chapters;
+    converts convertible audio streams to E-AC-3 at the channel-derived
+    bit rate and copies the remaining ones untouched.
+
+    Args:
+        source_path: Media file to read.
+        output_path: MKV file to write.
+        streams: Probed streams of the source, from probe_media_streams.
+
+    Returns:
+        The complete argv list for subprocess.run.
+    """
     ffmpeg: str = find_required_tool("ffmpeg")
     command: list[str] = [
         ffmpeg,
@@ -603,7 +703,18 @@ def remux_file(
     output_path: Path,
     streams: Sequence[Stream] | None = None,
 ) -> None:
-    """Remux a single media file to MKV with E-AC-3 audio."""
+    """Remux a single media file to MKV with E-AC-3 audio.
+
+    Args:
+        source_path: Media file to read.
+        output_path: MKV file to write, created under its parent folder.
+        streams: Probed streams to reuse; probed from source_path when
+            omitted.
+
+    Raises:
+        SystemExit: When the output already exists, FFmpeg fails, or the
+            output file is missing or empty afterwards.
+    """
     resolved_streams: Sequence[Stream] = (
         streams
         if streams is not None
@@ -643,7 +754,20 @@ def remux_file(
 
 
 def extract_media_archive(archive_path: Path, working_folder: Path) -> Path:
-    """Extract a ZIP or TAR archive safely."""
+    """Extract a ZIP or TAR archive safely into the working folder.
+
+    Args:
+        archive_path: ZIP or TAR archive to extract.
+        working_folder: Temporary folder that receives the contents.
+
+    Returns:
+        The single top-level folder when the archive wraps exactly one;
+        otherwise the extraction destination itself.
+
+    Raises:
+        SystemExit: When the archive holds an unsafe member path or uses
+            an unsupported format.
+    """
     destination_path: Path = (
         working_folder / f"{_archive_stem(archive_path)}{EXTRACTED_FOLDER_SUFFIX}"
     )
@@ -693,7 +817,17 @@ def extract_media_archive(archive_path: Path, working_folder: Path) -> Path:
 
 
 def create_tar_archive(folder_path: Path) -> Path:
-    """Package folder into a .tar archive for uploading."""
+    """Package a folder into a .tar archive for uploading.
+
+    Args:
+        folder_path: Folder whose files are archived recursively.
+
+    Returns:
+        The created <folder>.tar archive next to the folder.
+
+    Raises:
+        SystemExit: When the archive destination already exists.
+    """
     archive: Path = folder_path.with_name(f"{folder_path.name}.tar")
     if archive.exists():
         exit_with_error(f"Archive destination already exists: {archive}.")
@@ -728,7 +862,22 @@ def has_aria2c_control_file(file_path: Path) -> bool:
 
 
 def download_file(url: str, destination_folder: Path) -> Path:
-    """Download a file using aria2c or curl."""
+    """Download a file with aria2c, falling back to curl.
+
+    aria2c resumes from its .aria2 control file. curl downloads to a
+    <name>.part file, resumed by --continue-at, and renames it on success.
+
+    Args:
+        url: HTTP or HTTPS URL to download.
+        destination_folder: Folder that receives the completed file.
+
+    Returns:
+        The downloaded file.
+
+    Raises:
+        SystemExit: When neither tool is installed, the download fails, or
+            the folder ends up with zero or multiple candidate files.
+    """
     aria2c: str | None = shutil.which("aria2c")
     curl: str | None = shutil.which("curl")
 
@@ -802,7 +951,18 @@ def download_file(url: str, destination_folder: Path) -> Path:
 
 
 def upload_file_to_bzzhr(file_to_upload: Path) -> str:
-    """Upload file to bzzhr.co and return download link."""
+    """Upload a file to bzzhr.co and return its download page link.
+
+    Args:
+        file_to_upload: File to upload; its name becomes part of the URL.
+
+    Returns:
+        The https://bzzhr.co/<id> download page URL.
+
+    Raises:
+        SystemExit: On curl failure, an unparseable response, or a missing
+            file ID in the response.
+    """
     curl: str = find_required_tool("curl")
     encoded_name: str = urllib.parse.quote(file_to_upload.name)
     upload_url: str = f"https://w.bzzhr.co/{encoded_name}"
@@ -895,7 +1055,25 @@ def remove_partial_download(downloaded_path: Path) -> None:
 def acquire_source_path(
     input_arg: str, stage_times: list[tuple[str, float]]
 ) -> tuple[Path, bool]:
-    """Resolve the input to a local path and whether it lives in the partial folder."""
+    """Resolve the input argument to a local path, downloading when needed.
+
+    URL inputs download into the stable per-URL partial folder, resuming
+    interrupted downloads and reusing completed files from earlier failed
+    runs. Local inputs are read in place.
+
+    Args:
+        input_arg: URL, archive, or media file path from the command line.
+        stage_times: Time-report rows collected for the run.
+
+    Returns:
+        A (source_path, was_downloaded) pair; was_downloaded is True when
+        the path lives in the partial-downloads folder and should be
+        deleted after a successful upload.
+
+    Raises:
+        SystemExit: When the URL scheme is unsupported or a local input
+            can't be found.
+    """
     parsed_url:urllib.parse.ParseResult = urllib.parse.urlparse(input_arg)
 
     if parsed_url.scheme in {"http", "https"}:
@@ -947,7 +1125,16 @@ def acquire_source_path(
 def prepare_single_file_upload(
     source_path: Path, working_folder: Path, stage_times: list[tuple[str, float]]
 ) -> Path:
-    """Remux one media file and return the output file to upload."""
+    """Remux one media file and return the output file to upload.
+
+    Args:
+        source_path: Media file to remux.
+        working_folder: Temporary folder that receives the .FFMPEG output.
+        stage_times: Time-report rows collected for the run.
+
+    Returns:
+        The remuxed MKV to upload.
+    """
     print_heading("Remuxing")
     print_found_item(source_path, blank_after=False)
     with timed_stage(f"Remux {source_path.name}", stage_times):
@@ -965,7 +1152,21 @@ def prepare_single_file_upload(
 def prepare_archive_upload(
     archive_path: Path, working_folder: Path, stage_times: list[tuple[str, float]]
 ) -> Path:
-    """Extract an archive, remux each media file, and return the repacked TAR."""
+    """Extract an archive, remux each media file, and return the repacked TAR.
+
+    Args:
+        archive_path: ZIP or TAR archive to process.
+        working_folder: Temporary folder for extraction and remux outputs.
+        stage_times: Time-report rows collected for the run.
+
+    Returns:
+        The repacked TAR to upload. Extracted originals and loose outputs
+        are removed along the way to cap peak disk usage.
+
+    Raises:
+        SystemExit: When the archive holds no media files or any remux
+            fails; a partial archive is never uploaded.
+    """
     with timed_stage("Extract", stage_times):
         extracted_folder: Path = extract_media_archive(
             archive_path, working_folder
