@@ -130,7 +130,10 @@ def find_required_tool(binary_name: str) -> str:
     """Verify that an external binary exists in the system PATH."""
     binary_path: str | None = shutil.which(binary_name)
     if not binary_path:
-        exit_with_error(f"The required tool '{binary_name}' wasn't found in PATH.")
+        exit_with_error(
+            f"'{binary_name}' is required but wasn't found in PATH. "
+            "Install it, then run the command again."
+        )
     return binary_path
 
 
@@ -424,11 +427,14 @@ def resolve_folder_jobs(
         resolved_destination == resolved_source
         or resolved_source in resolved_destination.parents
     ):
-        exit_with_error("Output folder cannot be inside the input folder.")
+        exit_with_error(
+            "Output folder cannot be inside the input folder. "
+            "Choose a different output folder."
+        )
 
     discovered_files: list[Path] = collect_media_files(source_folder)
     if not discovered_files:
-        exit_with_error(f"No supported media files were found in {source_folder}.")
+        exit_with_error(f"No supported media files were found in '{source_folder}'.")
 
     folder_jobs: list[tuple[Path, Path]] = []
     media_file: Path
