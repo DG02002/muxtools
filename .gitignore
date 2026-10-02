@@ -19,6 +19,7 @@ env/
 # Editor files
 .vscode/
 .idea/
+.zcodeignore
 
 # Tooling temp files & directories
 *.tmp
