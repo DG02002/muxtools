@@ -80,6 +80,15 @@ CONVERT_AUDIO_CODECS: Final[frozenset[str]] = frozenset({
 
 MEDIA_EXTENSIONS: Final[frozenset[str]] = frozenset({".mkv", ".mp4", ".webm"})
 
+# E-AC-3 encoding profile (channel layout tag, bit rate) per channel count.
+# Unlisted counts (3, 4, 5 channels) fall back to the stereo rate with no layout tag.
+EAC3_CHANNEL_PROFILES: Final[dict[int, tuple[str | None, str]]] = {
+    1: ("1.0", "224k"),
+    2: ("2.0", "224k"),
+    6: ("5.1", "640k"),
+}
+DEFAULT_EAC3_PROFILE: Final[tuple[str | None, str]] = (None, "224k")
+
 # Audio codec tokens in release filenames to replace with DDP when transcoding:
 # - TrueHD, TrueHD Atmos
 # - DTS, DTS-HD MA, DTS-HD HRA, DTS-HD, DTS-MA, DTS-ES, DTS:X, DTS-X
@@ -400,7 +409,7 @@ def probe_media_streams(media_path: Path) -> list[Stream]:
 
 
 # --------------------------------------------------
-# Audio Bit Rate & Filename Formatting
+# Audio Selection & Filename Formatting
 # --------------------------------------------------
 
 
@@ -424,38 +433,6 @@ def select_audio_streams(streams: Sequence[Stream]) -> list[Stream]:
         or stream.get("tags", {}).get("language", "").lower() in KEEP_LANGUAGES
     ]
     return selected_audio_streams or all_audio_streams
-
-
-def probe_and_select_audio_streams(
-    media_path: Path,
-) -> tuple[list[Stream], list[Stream]]:
-    """Probe a media file and select the audio streams to remux.
-
-    Args:
-        media_path: Media file to inspect with ffprobe.
-
-    Returns:
-        A (streams, audio_streams) pair: every probed stream, and the
-        selected audio subset used for naming and remuxing.
-
-    Raises:
-        SystemExit: When the file has no audio streams at all.
-    """
-    streams: list[Stream] = probe_media_streams(media_path)
-    audio_streams: list[Stream] = select_audio_streams(streams)
-    if not audio_streams:
-        exit_with_error(f"No audio streams were found in '{media_path.name}'.")
-    return streams, audio_streams
-
-
-# E-AC-3 encoding profile (channel layout tag, bit rate) per channel count.
-# Unlisted counts (3, 4, 5 channels) fall back to the stereo rate with no layout tag.
-EAC3_CHANNEL_PROFILES: Final[dict[int, tuple[str | None, str]]] = {
-    1: ("1.0", "224k"),
-    2: ("2.0", "224k"),
-    6: ("5.1", "640k"),
-}
-DEFAULT_EAC3_PROFILE: Final[tuple[str | None, str]] = (None, "224k")
 
 
 def eac3_bit_rate_for(channels: int) -> str:
@@ -1120,6 +1097,28 @@ def acquire_source_path(
     print_heading("Using local input")
     print()
     return local_path, False
+
+
+def probe_and_select_audio_streams(
+    media_path: Path,
+) -> tuple[list[Stream], list[Stream]]:
+    """Probe a media file and select the audio streams to remux.
+
+    Args:
+        media_path: Media file to inspect with ffprobe.
+
+    Returns:
+        A (streams, audio_streams) pair: every probed stream, and the
+        selected audio subset used for naming and remuxing.
+
+    Raises:
+        SystemExit: When the file has no audio streams at all.
+    """
+    streams: list[Stream] = probe_media_streams(media_path)
+    audio_streams: list[Stream] = select_audio_streams(streams)
+    if not audio_streams:
+        exit_with_error(f"No audio streams were found in '{media_path.name}'.")
+    return streams, audio_streams
 
 
 def prepare_single_file_upload(
