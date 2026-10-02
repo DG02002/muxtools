@@ -90,14 +90,14 @@ def format_duration(seconds: float) -> str:
     hours, remainder = divmod(total_seconds, 3600)
     minutes, remaining_seconds = divmod(remainder, 60)
 
-    time_components: list[str] = []
+    parts: list[str] = []
     if hours > 0:
-        time_components.append(f"{hours}h")
+        parts.append(f"{hours}h")
     if minutes > 0 or hours > 0:
-        time_components.append(f"{minutes}m")
-    time_components.append(f"{remaining_seconds}s")
+        parts.append(f"{minutes}m")
+    parts.append(f"{remaining_seconds}s")
 
-    return " ".join(time_components)
+    return " ".join(parts)
 
 
 def print_stage_times(
@@ -154,7 +154,7 @@ def probe_media_streams(source_file_path: Path) -> list[dict[str, Any]]:
     ]
 
     try:
-        process_result: subprocess.CompletedProcess[str] = subprocess.run(
+        result: subprocess.CompletedProcess[str] = subprocess.run(
             probe_command,
             capture_output=True,
             text=True,
@@ -163,18 +163,18 @@ def probe_media_streams(source_file_path: Path) -> list[dict[str, Any]]:
         )
     except subprocess.TimeoutExpired:
         exit_with_error(
-            f"ffprobe didn't respond within {FFPROBE_TIMEOUT_SECONDS} seconds "
-            f"for '{source_file_path.name}'."
+            f"Unable to inspect '{source_file_path.name}' with ffprobe: timed out "
+            f"after {FFPROBE_TIMEOUT_SECONDS} seconds."
         )
 
-    if process_result.returncode != 0:
-        error_output: str = process_result.stderr.strip()
+    if result.returncode != 0:
+        error_output: str = result.stderr.strip()
         exit_with_error(
             f"Unable to inspect '{source_file_path.name}' with ffprobe:\n{error_output}"
         )
 
     try:
-        parsed_json: dict[str, Any] = json.loads(process_result.stdout)
+        parsed_json: dict[str, Any] = json.loads(result.stdout)
         return parsed_json.get("streams", [])
     except json.JSONDecodeError:
         exit_with_error(
@@ -314,7 +314,7 @@ def remux_file(
 ) -> None:
     """Remux a single media file to MP4 using an atomic temporary directory write."""
     if not source_file_path.is_file():
-        exit_with_error(f"Input file not found: {source_file_path}")
+        exit_with_error(f"Unable to find '{source_file_path}'.")
 
     output_file_path.parent.mkdir(parents=True, exist_ok=True)
     stream_metadata: list[dict[str, Any]] = probe_media_streams(source_file_path)
@@ -329,7 +329,7 @@ def remux_file(
         prefix=TEMP_DIRECTORY_PREFIX, dir=output_file_path.parent
     ) as temporary_directory:
         temporary_output_path: Path = Path(temporary_directory) / output_file_path.name
-        gpac_command: list[str] = build_gpac_command(
+        command: list[str] = build_gpac_command(
             source_file_path,
             temporary_output_path,
             stream_metadata,
@@ -337,15 +337,15 @@ def remux_file(
             verbose,
         )
 
-        print(shlex.join(gpac_command))
-        process_result: subprocess.CompletedProcess[bytes] = subprocess.run(
-            gpac_command, check=False
+        print(shlex.join(command))
+        result: subprocess.CompletedProcess[bytes] = subprocess.run(
+            command, check=False
         )
 
-        if process_result.returncode != 0:
+        if result.returncode != 0:
             exit_with_error(
                 f"Unable to remux '{source_file_path.name}' with GPAC "
-                f"(exit code {process_result.returncode})."
+                f"(exit code {result.returncode})."
             )
 
         if (
@@ -353,7 +353,8 @@ def remux_file(
             or temporary_output_path.stat().st_size == 0
         ):
             exit_with_error(
-                f"GPAC didn't produce an output file for '{source_file_path.name}'."
+                f"GPAC finished without creating an output file for "
+                f"'{source_file_path.name}'."
             )
 
         os.replace(temporary_output_path, output_file_path)
@@ -372,7 +373,7 @@ def mp4_output_path_for(source_path: Path) -> Path:
     return source_path.with_suffix(target_suffix)
 
 
-def collect_media_files_from_directory(directory_path: Path) -> list[Path]:
+def collect_media_files(directory_path: Path) -> list[Path]:
     """Recursively collect supported media files from a directory."""
     # Skip macOS AppleDouble ("._foo.mkv") and other dotfiles; they match the
     # media extension but are metadata, not media.
@@ -408,7 +409,7 @@ def resolve_folder_jobs(
 ) -> list[tuple[Path, Path]]:
     """Resolve destination paths for all media files inside a directory."""
     if not source_folder.is_dir():
-        exit_with_error(f"Input is not a valid file or folder: {source_folder}")
+        exit_with_error(f"Unable to find the folder '{source_folder}'.")
 
     destination_folder: Path = (
         output_destination / source_folder.name
@@ -425,7 +426,7 @@ def resolve_folder_jobs(
     ):
         exit_with_error("Output folder cannot be inside the input folder.")
 
-    discovered_files: list[Path] = collect_media_files_from_directory(source_folder)
+    discovered_files: list[Path] = collect_media_files(source_folder)
     if not discovered_files:
         exit_with_error(f"No supported media files were found in {source_folder}.")
 
@@ -457,7 +458,7 @@ def plan_remux_jobs(
                 resolve_folder_jobs(source, output_destination, has_multiple_inputs)
             )
         else:
-            exit_with_error(f"Input is not a valid file or folder: {source}")
+            exit_with_error(f"Unable to find a file or folder at '{source}'.")
 
     # Guard against accidental filename collisions in batch destinations
     all_destinations: list[Path] = [
@@ -477,35 +478,35 @@ def plan_remux_jobs(
 
 
 def main() -> None:
-    """Parse command line arguments and execute the remuxing pipeline."""
-    argument_parser: argparse.ArgumentParser = argparse.ArgumentParser(
+    """Parse command line args and execute the remuxing pipeline."""
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description="Remux media into QuickTime-compatible MP4 files using GPAC"
     )
-    argument_parser.add_argument(
+    parser.add_argument(
         "sources",
         nargs="+",
         type=Path,
         help="Media files or folders to process.",
     )
-    argument_parser.add_argument(
+    parser.add_argument(
         "-o",
         "--output",
         type=Path,
         help="Optional output file or folder destination.",
     )
-    argument_parser.add_argument(
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
         help="Show full GPAC log output and warnings.",
     )
-    arguments: argparse.Namespace = argument_parser.parse_args()
+    args: argparse.Namespace = parser.parse_args()
 
     # Fail fast on missing tools before any remuxing starts.
     for binary_name in ("ffprobe", "gpac"):
         find_required_tool(binary_name)
 
-    start_time: float = time.monotonic()
+    run_started: float = time.monotonic()
     print(
         f"\n{ANSI_BOLD}quickmp4 v{VERSION}{ANSI_RESET}: "
         "Remux media into QuickTime-compatible MP4 files using GPAC"
@@ -513,11 +514,12 @@ def main() -> None:
 
     try:
         remux_jobs: list[tuple[Path, Path]] = plan_remux_jobs(
-            arguments.sources, arguments.output
+            args.sources, args.output
         )
 
         stage_times: list[tuple[str, float]] = []
         total_jobs: int = len(remux_jobs)
+        job_file_names: list[str] = [source.name for source, _ in remux_jobs]
         index: int
         source_file: Path
         target_file: Path
@@ -533,19 +535,25 @@ def main() -> None:
 
             # Guard clause: skip existing files in batch mode
             if total_jobs > 1 and target_file.exists():
-                print(f"{ANSI_YELLOW}Skipped{ANSI_RESET} [{target_file}]")
+                print(f"{ANSI_YELLOW}Skipping{ANSI_RESET} [{target_file}]")
                 continue
 
             # Single-file mode replaces an existing destination on purpose.
             if total_jobs == 1 and target_file.exists():
                 print(f"{ANSI_YELLOW}Overwriting{ANSI_RESET} [{target_file}]")
 
+            # Fall back to the full path when two jobs share a file name.
+            time_label: str = (
+                source_file.name
+                if job_file_names.count(source_file.name) == 1
+                else str(source_file)
+            )
             file_started: float = time.monotonic()
-            remux_file(source_file, target_file, arguments.verbose)
-            stage_times.append((source_file.name, time.monotonic() - file_started))
+            remux_file(source_file, target_file, args.verbose)
+            stage_times.append((time_label, time.monotonic() - file_started))
             print(f"{ANSI_GREEN}Saved {target_file}{ANSI_RESET}")
 
-        print_stage_times(stage_times, time.monotonic() - start_time)
+        print_stage_times(stage_times, time.monotonic() - run_started)
 
     except KeyboardInterrupt:
         sys.stderr.write(

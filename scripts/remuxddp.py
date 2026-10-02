@@ -249,8 +249,8 @@ def print_saved(path: Path) -> None:
 
 def format_duration(seconds: float) -> str:
     """Format seconds as a compact duration like '1h 2m 3s'."""
-    rounded = max(0, round(seconds))
-    hours, remainder = divmod(rounded, 3600)
+    total_seconds = max(0, round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
     minutes, remaining_seconds = divmod(remainder, 60)
     parts: list[str] = []
     if hours:
@@ -301,11 +301,14 @@ def exit_with_error(message: str, code: int = 1) -> NoReturn:
 # --------------------------------------------------
 
 
-def validate_required_binary_in_path(binary_name: str) -> str:
+def find_required_tool(binary_name: str) -> str:
     """Ensure an external binary exists on PATH."""
     path: str | None = shutil.which(binary_name)
     if not path:
-        exit_with_error(f"The required tool '{binary_name}' wasn't found in PATH.")
+        exit_with_error(
+            f"'{binary_name}' is required but wasn't found in PATH. "
+            "Install it, then run the command again."
+        )
     return path
 
 
@@ -331,9 +334,9 @@ def _archive_stem(path: Path) -> str:
 # --------------------------------------------------
 
 
-def probe_media_streams_with_ffprobe(media_path: Path) -> list[Stream]:
+def probe_media_streams(media_path: Path) -> list[Stream]:
     """Inspect stream metadata with ffprobe."""
-    ffprobe: str = validate_required_binary_in_path("ffprobe")
+    ffprobe: str = find_required_tool("ffprobe")
     command: list[str] = [
         ffprobe,
         "-v",
@@ -355,8 +358,8 @@ def probe_media_streams_with_ffprobe(media_path: Path) -> list[Stream]:
         )
     except subprocess.TimeoutExpired:
         exit_with_error(
-            f"ffprobe didn't respond within {FFPROBE_TIMEOUT_SECONDS} seconds "
-            f"for '{media_path.name}'."
+            f"Unable to inspect '{media_path.name}' with ffprobe: timed out after "
+            f"{FFPROBE_TIMEOUT_SECONDS} seconds."
         )
     if result.returncode != 0:
         error_message: str = result.stderr.strip()
@@ -394,7 +397,7 @@ def probe_and_select_audio_streams(
     media_path: Path,
 ) -> tuple[list[Stream], list[Stream]]:
     """Probe a media file and select its audio streams, exiting when none exist."""
-    streams: list[Stream] = probe_media_streams_with_ffprobe(media_path)
+    streams: list[Stream] = probe_media_streams(media_path)
     audio_streams: list[Stream] = select_audio_streams(streams)
     if not audio_streams:
         exit_with_error(f"No audio streams were found in '{media_path.name}'.")
@@ -411,7 +414,7 @@ EAC3_CHANNEL_PROFILES: Final[dict[int, tuple[str | None, str]]] = {
 DEFAULT_EAC3_PROFILE: Final[tuple[str | None, str]] = (None, "224k")
 
 
-def determine_eac3_bit_rate_by_channel_count(channels: int) -> str:
+def eac3_bit_rate_for(channels: int) -> str:
     """Select bit rate for E-AC-3 based on audio channels."""
     if channels > 6:
         exit_with_error(
@@ -436,7 +439,7 @@ def build_ddp_tag_string(audio_streams: Sequence[Stream], converted: set[str]) -
     return ".".join(layouts or ["DDP"])
 
 
-def determine_title_end(stem: str) -> int:
+def find_title_end(stem: str) -> int:
     """Find where the title ends: after the first episode marker or release year."""
     episode_or_year_matches: list[re.Match[str]] = [
         match
@@ -481,7 +484,7 @@ def insert_ddp_tag(stem: str, tag_str: str, title_end: int) -> str:
     return f"{stem}{sep}{tag_str}"
 
 
-def generate_ddp_remuxed_filename(
+def ddp_remuxed_filename_for(
     source_path: Path, audio_streams: Sequence[Stream]
 ) -> str:
     """Generate output filename replacing or inserting DDP audio tags."""
@@ -507,7 +510,7 @@ def generate_ddp_remuxed_filename(
     has_ddp: bool = bool(EXISTING_DDP_PATTERN.search(stem))
     if stem == original_stem and not has_ddp:
         tag_str: str = build_ddp_tag_string(audio_streams, converted)
-        stem = insert_ddp_tag(stem, tag_str, determine_title_end(stem))
+        stem = insert_ddp_tag(stem, tag_str, find_title_end(stem))
 
     return f"{stem}.mkv"
 
@@ -517,13 +520,13 @@ def generate_ddp_remuxed_filename(
 # --------------------------------------------------
 
 
-def construct_ffmpeg_ddp_remux_command(
+def build_ffmpeg_remux_command(
     source_path: Path,
     output_path: Path,
     streams: Sequence[Stream],
 ) -> list[str]:
     """Build the FFmpeg command to copy video and transcode audio to E-AC-3."""
-    ffmpeg: str = validate_required_binary_in_path("ffmpeg")
+    ffmpeg: str = find_required_tool("ffmpeg")
     command: list[str] = [
         ffmpeg,
         "-hide_banner",
@@ -565,7 +568,7 @@ def construct_ffmpeg_ddp_remux_command(
         codec: str = stream.get("codec_name", "").lower()
         if codec in CONVERT_AUDIO_CODECS:
             channels: int = stream.get("channels", 2)
-            bit_rate: str = determine_eac3_bit_rate_by_channel_count(channels)
+            bit_rate: str = eac3_bit_rate_for(channels)
             language: str = stream.get("tags", {}).get("language", "")
             command.extend([
                 f"-c:a:{output_index}",
@@ -595,7 +598,7 @@ def construct_ffmpeg_ddp_remux_command(
     return command
 
 
-def remux_single_media_file(
+def remux_file(
     source_path: Path,
     output_path: Path,
     streams: Sequence[Stream] | None = None,
@@ -604,7 +607,7 @@ def remux_single_media_file(
     resolved_streams: Sequence[Stream] = (
         streams
         if streams is not None
-        else probe_media_streams_with_ffprobe(source_path)
+        else probe_media_streams(source_path)
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
@@ -612,7 +615,7 @@ def remux_single_media_file(
             f"The output file already exists: {output_path}. "
             "Two inputs may map to the same output name."
         )
-    command: list[str] = construct_ffmpeg_ddp_remux_command(
+    command: list[str] = build_ffmpeg_remux_command(
         source_path=source_path,
         output_path=output_path,
         streams=resolved_streams,
@@ -639,7 +642,7 @@ def remux_single_media_file(
 # --------------------------------------------------
 
 
-def safely_extract_media_archive(archive_path: Path, working_folder: Path) -> Path:
+def extract_media_archive(archive_path: Path, working_folder: Path) -> Path:
     """Extract a ZIP or TAR archive safely."""
     destination_path: Path = (
         working_folder / f"{_archive_stem(archive_path)}{EXTRACTED_FOLDER_SUFFIX}"
@@ -679,13 +682,17 @@ def safely_extract_media_archive(archive_path: Path, working_folder: Path) -> Pa
             "Unsupported archive format. Use a ZIP (.zip) or TAR (.tar.gz, .tar.bz2, .tar.xz) file."
         )
 
-    visible: list[Path] = [
+    top_level_paths: list[Path] = [
         path for path in destination_path.iterdir() if not path.name.startswith(".")
     ]
-    return visible[0] if len(visible) == 1 and visible[0].is_dir() else destination_path
+    return (
+        top_level_paths[0]
+        if len(top_level_paths) == 1 and top_level_paths[0].is_dir()
+        else destination_path
+    )
 
 
-def create_tar_archive_from_folder(folder_path: Path) -> Path:
+def create_tar_archive(folder_path: Path) -> Path:
     """Package folder into a .tar archive for uploading."""
     archive: Path = folder_path.with_name(f"{folder_path.name}.tar")
     if archive.exists():
@@ -707,12 +714,20 @@ def create_tar_archive_from_folder(folder_path: Path) -> Path:
 # --------------------------------------------------
 
 
+_PARTIAL_DOWNLOAD_SUFFIXES: Final[tuple[str, ...]] = (".aria2", ".part")
+
+
 def is_partial_download_artifact(path: Path) -> bool:
     """True for aria2c control files and curl partials, never completed files."""
-    return path.name.endswith((".aria2", ".part"))
+    return path.name.endswith(_PARTIAL_DOWNLOAD_SUFFIXES)
 
 
-def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Path:
+def has_aria2c_control_file(file_path: Path) -> bool:
+    """True while aria2c still tracks the file as incomplete (.aria2 control file)."""
+    return file_path.with_name(f"{file_path.name}.aria2").exists()
+
+
+def download_file(url: str, destination_folder: Path) -> Path:
     """Download a file using aria2c or curl."""
     aria2c: str | None = shutil.which("aria2c")
     curl: str | None = shutil.which("curl")
@@ -742,6 +757,9 @@ def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Pa
         command = [
             curl,
             "-L",
+            # --fail rejects HTTP errors (exit code 22) and writes no response
+            # body at all, so an error page never pollutes the resumable .part.
+            "--fail",
             "--continue-at",
             "-",
             "-o",
@@ -756,6 +774,10 @@ def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Pa
         args=command, check=False
     )
     if result.returncode != 0:
+        if result.returncode == 22:
+            exit_with_error(
+                "Download failed: the server returned an HTTP error (curl exit code 22)."
+            )
         exit_with_error(f"Download failed with exit code {result.returncode}.")
 
     if curl_partial_path is not None:
@@ -772,15 +794,16 @@ def download_remote_file_with_fallback(url: str, destination_folder: Path) -> Pa
     if len(downloaded_files) > 1:
         file_names: str = ", ".join(path.name for path in sorted(downloaded_files))
         exit_with_error(
-            "The download produced more than one file "
-            f"({file_names}); can't tell which one to process."
+            f"The download produced more than one file ({file_names}). "
+            f"Keep the file you want in '{destination_folder}', "
+            "then run the command again."
         )
     return downloaded_files[0]
 
 
-def upload_media_file_to_bzzhr(file_to_upload: Path) -> str:
+def upload_file_to_bzzhr(file_to_upload: Path) -> str:
     """Upload file to bzzhr.co and return download link."""
-    curl: str = validate_required_binary_in_path("curl")
+    curl: str = find_required_tool("curl")
     encoded_name: str = urllib.parse.quote(file_to_upload.name)
     upload_url: str = f"https://w.bzzhr.co/{encoded_name}"
 
@@ -790,6 +813,9 @@ def upload_media_file_to_bzzhr(file_to_upload: Path) -> str:
         # Retries transient failures; safe because re-PUTs overwrite by name.
         "--retry",
         "3",
+        # --fail-with-body fails on HTTP errors (exit code 22) while keeping
+        # the server's error response so it can be shown. Needs curl 7.76.0+.
+        "--fail-with-body",
         "-o",
         "-",
         "-T",
@@ -807,7 +833,16 @@ def upload_media_file_to_bzzhr(file_to_upload: Path) -> str:
         check=False,
     )
     if result.returncode != 0:
-        exit_with_error(f"bzzhr.co upload failed (exit code {result.returncode}).")
+        if result.returncode == 22:
+            error_body: str = result.stdout.strip()
+            detail: str = f":\n{error_body}" if error_body else ""
+            exit_with_error(
+                "The bzzhr.co upload failed because the server returned an "
+                f"HTTP error{detail}."
+            )
+        exit_with_error(
+            f"The bzzhr.co upload failed (exit code {result.returncode})."
+        )
 
     try:
         response: BzzhrResponse = json.loads(result.stdout)
@@ -846,9 +881,11 @@ def partial_download_folder_for_url(url: str) -> Path:
 
 def remove_partial_download(downloaded_path: Path) -> None:
     """Delete an uploaded download, keeping the folder only if partials remain."""
+    for suffix in _PARTIAL_DOWNLOAD_SUFFIXES:
+        downloaded_path.with_name(f"{downloaded_path.name}{suffix}").unlink(
+            missing_ok=True
+        )
     downloaded_path.unlink(missing_ok=True)
-    downloaded_path.with_name(f"{downloaded_path.name}.aria2").unlink(missing_ok=True)
-    downloaded_path.with_name(f"{downloaded_path.name}.part").unlink(missing_ok=True)
     try:
         downloaded_path.parent.rmdir()
     except OSError:
@@ -859,9 +896,9 @@ def acquire_source_path(
     input_arg: str, stage_times: list[tuple[str, float]]
 ) -> tuple[Path, bool]:
     """Resolve the input to a local path and whether it lives in the partial folder."""
-    parsed: urllib.parse.ParseResult = urllib.parse.urlparse(input_arg)
+    parsed_url:urllib.parse.ParseResult = urllib.parse.urlparse(input_arg)
 
-    if parsed.scheme in {"http", "https"}:
+    if parsed_url.scheme in {"http", "https"}:
         # Downloads live in a stable per-URL folder (never the temp dir) so
         # aria2c's --continue can resume an interrupted download when the same
         # URL is re-run; the file is deleted only after a successful upload.
@@ -873,17 +910,18 @@ def acquire_source_path(
             for path in download_folder.iterdir()
             if not is_partial_download_artifact(path)
         ]
-        if len(completed) == 1 and not completed[0].with_name(
-            f"{completed[0].name}.aria2"
-        ).exists():
+        if len(completed) == 1 and not has_aria2c_control_file(completed[0]):
             # Finished download from an earlier run that failed later; reuse it.
-            print_found_item(completed[0])
-            print_heading("Reusing previous download")
-            print()
+            # A stale control file disables reuse until it's deleted — that
+            # happens only when aria2c and curl are switched between runs.
+            with timed_stage("Reuse", stage_times):
+                print_found_item(completed[0])
+                print_heading("Reusing previous download")
+                print()
             return completed[0], True
 
         with timed_stage("Download", stage_times):
-            downloaded_path: Path = download_remote_file_with_fallback(
+            downloaded_path: Path = download_file(
                 input_arg, download_folder
             )
         print_saved(downloaded_path)
@@ -892,12 +930,12 @@ def acquire_source_path(
 
     local_path: Path = Path(input_arg).expanduser()
     if not local_path.exists():
-        if parsed.scheme:
+        if parsed_url.scheme:
             exit_with_error(
-                f"Unsupported URL scheme '{parsed.scheme}:'. "
-                "Use http://, https://, or a local file path."
+                f"'{parsed_url.scheme}://' isn't a supported URL scheme. "
+                "Use http:// or https://, or provide a local file path."
             )
-        exit_with_error(f"The file wasn't found: {local_path}.")
+        exit_with_error(f"Unable to find '{local_path}'.")
 
     # Local inputs are read in place; only outputs are written to the temp folder.
     print_found_item(local_path)
@@ -906,7 +944,7 @@ def acquire_source_path(
     return local_path, False
 
 
-def process_single_media_file(
+def prepare_single_file_upload(
     source_path: Path, working_folder: Path, stage_times: list[tuple[str, float]]
 ) -> Path:
     """Remux one media file and return the output file to upload."""
@@ -915,61 +953,63 @@ def process_single_media_file(
     with timed_stage(f"Remux {source_path.name}", stage_times):
         streams, audio_streams = probe_and_select_audio_streams(source_path)
         output_folder: Path = create_output_folder(working_folder, source_path.stem)
-        output_file: Path = output_folder / generate_ddp_remuxed_filename(
+        output_file: Path = output_folder / ddp_remuxed_filename_for(
             source_path, audio_streams
         )
-        remux_single_media_file(source_path, output_file, streams=streams)
+        remux_file(source_path, output_file, streams=streams)
     print_saved(output_file)
     print()
     return output_file
 
 
-def process_media_archive(
+def prepare_archive_upload(
     archive_path: Path, working_folder: Path, stage_times: list[tuple[str, float]]
 ) -> Path:
     """Extract an archive, remux each media file, and return the repacked TAR."""
     with timed_stage("Extract", stage_times):
-        extracted_folder: Path = safely_extract_media_archive(
+        extracted_folder: Path = extract_media_archive(
             archive_path, working_folder
         )
     output_folder: Path = create_output_folder(working_folder, extracted_folder.name)
 
     # Skip macOS AppleDouble ("._foo.mkv") and other dotfiles; they match the
     # media extension but are metadata, not media.
-    media_files_list: list[Path] = sorted(
+    media_files: list[Path] = sorted(
         path
         for path in extracted_folder.rglob("*")
         if path.is_file()
         and not path.name.startswith(".")
         and path.suffix.lower() in MEDIA_EXTENSIONS
     )
-    if not media_files_list:
+    if not media_files:
         exit_with_error("No media files were found in the archive.")
 
     print()
     print_heading("Remuxing")
-    total_media_files: int = len(media_files_list)
-    # One unreadable file aborts the whole run on purpose: a partial archive
-    # must never be uploaded.
-    for position, file_path in enumerate(media_files_list, 1):
-        print_batch_item(position, total_media_files, file_path)
+    media_file_count: int = len(media_files)
+    # When one file can't be processed, the run stops on purpose so that a
+    # partial archive is never uploaded.
+    for position, file_path in enumerate(media_files, 1):
+        print_batch_item(position, media_file_count, file_path)
         with timed_stage(f"Remux {file_path.name}", stage_times):
-            file_streams, file_audio = probe_and_select_audio_streams(file_path)
+            file_streams, file_audio_streams = probe_and_select_audio_streams(file_path)
             relative_path: Path = file_path.relative_to(extracted_folder).with_name(
-                generate_ddp_remuxed_filename(file_path, file_audio)
+                ddp_remuxed_filename_for(file_path, file_audio_streams)
             )
             output_path: Path = output_folder / relative_path
-            remux_single_media_file(file_path, output_path, streams=file_streams)
+            remux_file(file_path, output_path, streams=file_streams)
         print_saved(output_path)
         print()
 
-    # The extracted originals are dead weight once every file is remuxed, and
-    # the loose outputs are dead weight once the TAR exists; removing each
-    # keeps peak disk usage at roughly two copies of the media.
-    shutil.rmtree(extracted_folder)
+    # Remove the extracted originals once every file is remuxed, and the loose
+    # outputs once the TAR exists, to keep peak disk usage at about two copies
+    # of the media.
+    with timed_stage("Cleanup", stage_times):
+        shutil.rmtree(extracted_folder)
     with timed_stage("Archive", stage_times):
-        archive: Path = create_tar_archive_from_folder(output_folder)
-    shutil.rmtree(output_folder)
+        archive: Path = create_tar_archive(output_folder)
+    with timed_stage("Cleanup", stage_times):
+        shutil.rmtree(output_folder)
     return archive
 
 
@@ -986,13 +1026,13 @@ def main() -> None:
 
     # Fail fast on missing tools before a potentially large download starts.
     for binary_name in ("ffmpeg", "ffprobe", "curl"):
-        validate_required_binary_in_path(binary_name)
+        find_required_tool(binary_name)
 
-    started: float = time.monotonic()
+    run_started: float = time.monotonic()
     stage_times: list[tuple[str, float]] = []
     print(
         f"\n{ANSI_BOLD}remuxddp v{VERSION}{ANSI_RESET}: "
-        "Remux and upload a media file or collection"
+        "Remux and upload a media file or archive"
     )
     print(
         "Converts FLAC, DTS, TrueHD, MLP, ALAC, AAC, Opus, Vorbis, and PCM audio to E-AC-3."
@@ -1012,18 +1052,18 @@ def main() -> None:
             is_archive: bool = source_path.name.lower().endswith(_ARCHIVE_EXTENSIONS)
 
             if is_archive:
-                upload_target: Path = process_media_archive(
+                upload_target: Path = prepare_archive_upload(
                     source_path, working_folder, stage_times
                 )
             else:
-                upload_target = process_single_media_file(
+                upload_target = prepare_single_file_upload(
                     source_path, working_folder, stage_times
                 )
 
             with timed_stage("Upload", stage_times):
-                download_page: str = upload_media_file_to_bzzhr(upload_target)
+                download_page: str = upload_file_to_bzzhr(upload_target)
             print(f"{ANSI_GREEN}Download page:{ANSI_RESET} {download_page}")
-            print_stage_times(stage_times, time.monotonic() - started)
+            print_stage_times(stage_times, time.monotonic() - run_started)
 
             if was_downloaded:
                 remove_partial_download(source_path)
@@ -1035,7 +1075,7 @@ def main() -> None:
         )
         sys.exit(130)
     except OSError as error:
-        exit_with_error(f"Filesystem error: {error}")
+        exit_with_error(f"A file system error occurred: {error}")
 
 
 if __name__ == "__main__":
